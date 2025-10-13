@@ -31,7 +31,7 @@ from google.genai import types
 
 # ====== 設定 ======
 # ★指定されたスプレッドシートIDを使用
-SHARED_SPREADSHEET_ID = "1WPNNoB1TrIM_mFQW_WaTX1jFnCgNOiOPqiEhDv2b5ns" 
+SHARED_SPREADSHEET_ID = "1Ru2DT_zzKjTJptchWJitCb67VoffImGhgeOVjwlKukc" 
 KEYWORD = "トヨタ"
 SOURCE_SPREADSHEET_ID = SHARED_SPREADSHEET_ID
 SOURCE_SHEET_NAME = "Yahoo"
