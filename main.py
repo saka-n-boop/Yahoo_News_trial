@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-統合スクリプト（ホンダ版） - 最終設定バージョン：
+統合スクリプト（トヨタ版） - 最終設定バージョン：
 1. Yahooシートに記事リストを追記し、投稿日の古い順に並び替え (A-D列)。
 2. YahooシートのE-I列に対し、本文、コメント数、Gemini分析を実行し、空欄があれば更新。
 3. 当日シートを作成し、Yahooシートから前日15:00-当日14:59:59の範囲の全記事（A-I列）をコピー。
@@ -44,19 +44,19 @@ TZ_JST = timezone(timedelta(hours=9))
 
 # プロンプトファイルの指定
 PROMPT_FILES = [
-  "prompt_gemini_role.txt", # ロール設定
-  "prompt_posinega.txt",
-  "prompt_category.txt",
-  "prompt_score.txt"
+    "prompt_gemini_role.txt", # ロール設定
+    "prompt_posinega.txt",
+    "prompt_category.txt",
+    "prompt_score.txt"
 ]
 
 # --- Gemini クライアントの初期化 ---
 # GOOGLE_API_KEYはgenai.Client()がデフォルトで参照します
 try:
-  GEMINI_CLIENT = genai.Client()
+    GEMINI_CLIENT = genai.Client()
 except Exception as e:
-  print(f"警告: Geminiクライアントの初期化に失敗しました。Gemini分析はスキップされます。エラー: {e}")
-  GEMINI_CLIENT = None
+    print(f"警告: Geminiクライアントの初期化に失敗しました。Gemini分析はスキップされます。エラー: {e}")
+    GEMINI_CLIENT = None
 # ------------------------------------
 
 # グローバル変数としてプロンプトテンプレートを保持
@@ -65,23 +65,24 @@ GEMINI_PROMPT_TEMPLATE = None
 # ====== ヘルパー関数群 ======
 
 def jst_now() -> datetime:
-  return datetime.now(TZ_JST)
+    return datetime.now(TZ_JST)
 
 def format_datetime(dt_obj) -> str:
-  return dt_obj.strftime("%y/%m/%d %H:%M")
+    return dt_obj.strftime("%y/%m/%d %H:%M")
 
 def parse_post_date(raw, today_jst: datetime) -> Optional[datetime]:
-  if raw is None: return None
-  if isinstance(raw, str):
-      s = raw.strip()
-      s = re.sub(r"\([月火水木金土日]\)$", "", s).strip()
-      s = s.strip()
+    if raw is None: return None
+    if isinstance(raw, str):
+        s = raw.strip()
+        s = re.sub(r"\([月火水木金土日]\)$", "", s).strip()
+        s = s.strip()
+        # ここからインデントエラーを修正
         for fmt in ("%y/%m/%d %H:%M", "%m/%d %H:%M", "%Y/%m/%d %H:%M", "%Y/%m/%d %H:%M:%S"):
-          try:
-             dt = datetime.strptime(s, fmt)
+            try:
+                dt = datetime.strptime(s, fmt)
                 if fmt == "%m/%d %H:%M":
-                  dt = dt.replace(year=today_jst.year)
-return dt.replace(tzinfo=TZ_JST)
+                    dt = dt.replace(year=today_jst.year)
+                return dt.replace(tzinfo=TZ_JST)
             except ValueError:
                 pass
         return None
@@ -111,6 +112,7 @@ def load_gemini_prompt() -> str:
     combined_instructions = []
     
     try:
+        # スクリプトディレクトリを取得
         script_dir = os.path.dirname(os.path.abspath(__file__))
         
         # 1. ロール設定ファイル (prompt_gemini_role.txt) を最初に読み込む
@@ -153,7 +155,7 @@ def load_gemini_prompt() -> str:
 def analyze_with_gemini(text_to_analyze: str) -> Tuple[str, str, str]:
     if not GEMINI_CLIENT:
         return "N/A", "N/A", "0"
-    
+        
     if not text_to_analyze.strip():
         return "N/A", "N/A", "0"
 
@@ -362,7 +364,7 @@ def write_and_sort_news_list_to_source(gc: gspread.Client, articles: list[dict])
         
         print("  SOURCEシートを投稿日時の古い順に並び替えました。")
     else:
-        print("   SOURCEシートに追記すべき新しいデータはありません。")
+        print("    SOURCEシートに追記すべき新しいデータはありません。")
 
 
 def process_and_update_yahoo_sheet(gc: gspread.Client):
@@ -373,7 +375,7 @@ def process_and_update_yahoo_sheet(gc: gspread.Client):
     
     all_values = ws.get_all_values(value_render_option='UNFORMATTED_VALUE')
     if len(all_values) <= 1:
-        print("   Yahooシートにデータがないため、詳細取得・分析をスキップします。")
+        print("    Yahooシートにデータがないため、詳細取得・分析をスキップします。")
         return
         
     data_rows = all_values[1:]
@@ -385,6 +387,7 @@ def process_and_update_yahoo_sheet(gc: gspread.Client):
         url = data_row[0] if len(data_row) > 0 else "" 
         
         # 現在のE-I列の値を取得
+        # インデックスが範囲外の場合は空文字列 "" を代入する
         body = data_row[4] if len(data_row) > 4 else "" 
         comment_count = data_row[5] if len(data_row) > 5 else "" 
         sentiment = data_row[6] if len(data_row) > 6 else ""
@@ -395,8 +398,7 @@ def process_and_update_yahoo_sheet(gc: gspread.Client):
         needs_details = not body.strip() or not str(comment_count).strip()
         
         # フラグ: Gemini分析が必要か
-        # 本文が入っており、かつ分析結果（G, H, I列）のいずれかが空欄の場合に実行（本文がなくても分析は試行）
-        # 【★修正箇所★】int型に .strip() が呼ばれないよう str() で文字列に変換
+        # 本文が入っており、かつ分析結果（G, H, I列）のいずれかが空欄の場合に実行
         needs_analysis = not str(sentiment).strip() or not str(category).strip() or not str(relevance).strip()
 
         # スキップ条件: 本文が既に入っていて、かつ分析結果もすべて入っている場合のみ
@@ -441,19 +443,26 @@ def process_and_update_yahoo_sheet(gc: gspread.Client):
 
         # 3. 更新データを作成: [本文, コメント数, ポジネガ分類, カテゴリ分類, 関連度]
         # 更新するのは、値が変わる可能性のある E, F, G, H, I のみ
-        new_data_row = [
-            article_body if not body.strip() else body,
-            final_comment_count if not str(comment_count).strip() or str(comment_count).strip() == '0' else comment_count,
-            final_sentiment,
-            final_category,
-            final_relevance
-        ]
-        
-        # 既存の値から変更があった場合のみ更新辞書に加える（最適化のため）
-        current_data_check = [str(body), str(comment_count), str(sentiment), str(category), str(relevance)]
-        
-        # 強制的に更新対象とする
-        updates_dict[row_num] = [article_body, final_comment_count, final_sentiment, final_category, final_relevance]
+        # 既存の値を優先し、未入力の場合のみ取得した新しい値を使用するロジックを修正
+        new_body = article_body if not body.strip() else body
+        new_comment_count = final_comment_count if not str(comment_count).strip() or str(comment_count).strip() == '0' else comment_count
+
+        # Gemini結果は「分析が必要」と判定されたら、その結果で上書きする
+        if needs_analysis and article_body.strip():
+             new_sentiment = final_sentiment
+             new_category = final_category
+             new_relevance = final_relevance
+        elif needs_analysis and not article_body.strip():
+             new_sentiment = final_sentiment # N/A(No Body)
+             new_category = final_category # N/A
+             new_relevance = final_relevance # 0
+        else: # 分析が必要ない場合は既存値を保持
+             new_sentiment = sentiment
+             new_category = category
+             new_relevance = relevance
+
+        # 最終的な更新データ
+        updates_dict[row_num] = [new_body, new_comment_count, new_sentiment, new_category, new_relevance]
 
     if updates_dict:
         updates_list = []
@@ -471,7 +480,7 @@ def process_and_update_yahoo_sheet(gc: gspread.Client):
         ws.batch_update(updates_list, value_input_option='USER_ENTERED')
         print(f"  Yahooシートの {len(updates_dict)} 行のE-I列を更新しました。")
     else:
-        print("   Yahooシートで新たに取得・分析すべき空欄の行はありませんでした。")
+        print("    Yahooシートで新たに取得・分析すべき空欄の行はありませんでした。")
 
 
 def transfer_to_today_sheet(gc: gspread.Client):
@@ -493,16 +502,22 @@ def transfer_to_today_sheet(gc: gspread.Client):
 
     all_values = ws_src.get_all_values(value_render_option='UNFORMATTED_VALUE')
     if len(all_values) <= 1: 
-        print("   Yahooシートにデータがないため、当日シートへの転送をスキップします。")
+        print("    Yahooシートにデータがないため、当日シートへの転送をスキップします。")
         return
         
     header = all_values[0]
     data_rows = all_values[1:] 
     
     now = jst_now()
+    # 転送期間: 前日15:00:00 JST から 当日14:59:59 JST まで
     start = (now - timedelta(days=1)).replace(hour=15, minute=0, second=0, microsecond=0)
     end = now.replace(hour=14, minute=59, second=59, microsecond=0)
     
+    # もし現在時刻が 15:00 JST 以降であれば、期間を1日進める必要がある
+    if now.hour >= 15:
+        start = now.replace(hour=15, minute=0, second=0, microsecond=0)
+        end = (now + timedelta(days=1)).replace(hour=14, minute=59, second=59, microsecond=0)
+
     rows_to_transfer: List[List[Any]] = []
     
     for r in data_rows:
@@ -516,34 +531,15 @@ def transfer_to_today_sheet(gc: gspread.Client):
     
     final_data_to_write = [header] + rows_to_transfer
     
-    if final_data_to_write:
+    if len(final_data_to_write) > 1:
         range_end = gspread.utils.rowcol_to_a1(len(final_data_to_write), len(YAHOO_SHEET_HEADERS))
         ws_dest.update(values=final_data_to_write, range_name=f'A1:{range_end}', value_input_option='USER_ENTERED')
         print(f"  当日シートに {len(rows_to_transfer)} 件の記事（A-I列）を転送しました。")
     else:
-        print("   転送対象の期間内の記事がありませんでした。")
+        print("    転送対象の期間内の記事がありませんでした。")
 
 
 # ====== メイン処理 ======
 
 def main():
-    print("--- 統合スクリプト開始 ---")
-    
-    try:
-        gc = build_gspread_client()
-    except RuntimeError as e:
-        print(f"致命的エラー: {e}")
-        return
-    
-    yahoo_news_articles = get_yahoo_news_with_selenium(KEYWORD)
-    
-    write_and_sort_news_list_to_source(gc, yahoo_news_articles)
-    
-    process_and_update_yahoo_sheet(gc)
-    
-    transfer_to_today_sheet(gc)
-    
-    print("\n--- 統合スクリプト終了 ---")
-
-if __name__ == "__main__":
-    main()
+    print("---
