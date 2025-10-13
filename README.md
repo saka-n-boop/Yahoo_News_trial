@@ -1,0 +1,2 @@
+# Yahoo_Toyota_trial
+ToyotaのYahooニュース取得
