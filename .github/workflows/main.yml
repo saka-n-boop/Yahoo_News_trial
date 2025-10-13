@@ -1,0 +1,40 @@
+name: Run News Scraper (Google & Yahoo)
+
+on:
+  schedule:
+    # ? JSTで毎時0分（1時間おき）
+    - cron: '0 * * * *'
+    # ? JSTで毎日15:00（→UTCでは06:00）
+    - cron: '0 6 * * *'
+
+  workflow_dispatch:
+
+jobs:
+  scrape-news:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.9'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run Scraper
+      env:
+        GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+        # ★★★ ここに GOOGLE_API_KEY を追加しました ★★★
+        GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+      run: |
+        python main.py
+
+    - name: Check for workflow failure (optional)
+      if: ${{ failure() }}
+      run: echo "Workflow failed. Check logs for details."
