@@ -542,4 +542,25 @@ def transfer_to_today_sheet(gc: gspread.Client):
 # ====== メイン処理 ======
 
 def main():
-    print("---
+    print("--- 統合スクリプト開始 ---")
+    
+    try:
+        gc = build_gspread_client()
+    except RuntimeError as e:
+        print(f"致命的エラー: {e}")
+        return
+    
+    # 1. Yahooシートに記事リストを追記し、投稿日の古い順に並び替え
+    yahoo_news_articles = get_yahoo_news_with_selenium(KEYWORD)
+    write_and_sort_news_list_to_source(gc, yahoo_news_articles)
+    
+    # 2. YahooシートのE-I列に対し、本文、コメント数、Gemini分析を実行し、空欄があれば更新。
+    process_and_update_yahoo_sheet(gc)
+    
+    # 3. 当日シートを作成し、Yahooシートから対象期間の全記事（A-I列）をコピー。
+    transfer_to_today_sheet(gc)
+    
+    print("\n--- 統合スクリプト終了 ---")
+
+if __name__ == "__main__":
+    main()
