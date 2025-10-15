@@ -27,8 +27,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 # --- Gemini API 関連のインポート ---
 from google import genai
 from google.genai import types
-# ★ 追加 ★: エラー処理のために ResourceExhausted をインポート
-from google.api_core.exceptions import ResourceExhausted 
+from google.api_core.exceptions import ResourceExhausted  # ★ 追加・修正点: 429エラー対応 ★
 # ------------------------------------
 
 # ====== 設定 ======
@@ -165,7 +164,7 @@ def analyze_with_gemini(text_to_analyze: str) -> Tuple[str, str, str]:
     if not prompt_template:
         return "ERROR(Prompt Missing)", "ERROR", "0"
 
-    MAX_RETRIES = 3
+    MAX_RETRIES = 3 # ★ 修正点: リトライ回数を設定 ★
     for attempt in range(MAX_RETRIES):
         try:
             text_for_prompt = text_to_analyze[:3000]
@@ -190,14 +189,15 @@ def analyze_with_gemini(text_to_analyze: str) -> Tuple[str, str, str]:
             
             sentiment = analysis.get("sentiment", "N/A")
             category = analysis.get("category", "N/A")
-            relevance = str(analysis.get("relevance", "0")) # Geminiの出力が数値でも str() で文字列に変換
+            relevance = str(analysis.get("relevance", "0"))
 
             return sentiment, category, relevance
 
-        # ★ 429 エラー (ResourceExhausted) の処理を追加 ★
+        # ★ 修正点: 429 エラー (ResourceExhausted) の処理を追加 ★
         except ResourceExhausted as e:
             if attempt < MAX_RETRIES - 1:
-                wait_time = 2 ** attempt + random.random() # 1, 2, 4秒 + ランダムな揺らぎ
+                # 指数バックオフ + ランダムな揺らぎで待機
+                wait_time = 2 ** attempt + random.random() 
                 print(f"  🚨 Gemini API クォータ制限エラー (429)。{wait_time:.2f} 秒待機してリトライします (試行 {attempt + 1}/{MAX_RETRIES})。")
                 time.sleep(wait_time)
                 continue # 次の試行へ
@@ -210,7 +210,6 @@ def analyze_with_gemini(text_to_analyze: str) -> Tuple[str, str, str]:
             print(f"Gemini分析エラー: {e}")
             return "ERROR", "ERROR", "0"
             
-    # ここに到達した場合（本来は到達しないが、フォールバックとして）
     return "ERROR", "ERROR", "0"
 
 # ====== データ取得関数 ======
@@ -219,7 +218,7 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
     # A-D列（URL, タイトル, 投稿日時, ソース）のデータを取得
     print("  Yahoo!ニュース検索開始...")
     options = Options()
-    options.add_argument("--headless=new") 
+    options.add_argument("--headless=new")  
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
     options.add_argument("--window-size=1280,1024")
@@ -234,23 +233,49 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
         print(f"  WebDriverの初期化に失敗しました: {e}")
         return []
         
-    search_url = f"https://news.yahoo.co.jp/search p={keyword}&ei=utf-8&categories=domestic,world,business,it,science,life,local"
+    # ★ 修正点: 正しい検索URLを使用 (カテゴリ絞り込みURLに修正) ★
+    search_url = f"https://news.yahoo.co.jp/search?p={keyword}&ei=utf-8&categories=domestic,world,business,it,science,life,local"
+    
     driver.get(search_url)
     time.sleep(5)
     
     soup = BeautifulSoup(driver.page_source, "html.parser")
     driver.quit()
     
-    articles = soup.find_all("li", class_=re.compile("sc-1u4589e-0"))
     articles_data = []
     
+    # ★ 修正点: 記事リストセレクタの変更 (安定性の高い SearchList__item を試行) ★
+    
+    # 新しいセレクタ案1: 記事リストのコンテナを探し、その中のすべての <li> 要素を取得
+    main_list = soup.find("ul", class_=re.compile("SearchList__list"))
+    articles = main_list.find_all("li") if main_list else []
+    
+    # 新しいセレクタ案2: 記事一つ一つに付与されているクラス名で直接検索
+    if not articles:
+        articles = soup.find_all("li", class_=re.compile("SearchList__item"))
+
+    # 記事が見つからない場合、汎用的な li 要素も試す（最終手段）
+    if not articles:
+        print("  警告: 安定したセレクタで見つかりませんでした。汎用的な li 要素を試行します。")
+        # タイトル要素とリンクを持っているリストアイテムを探す
+        articles = [
+            li for li in soup.find_all('li') 
+            if li.find('a', href=re.compile("news\.yahoo\.co\.jp/articles/"))
+        ]
+        
     for article in articles:
         try:
-            title_tag = article.find("div", class_=re.compile("sc-3ls169-0"))
-            title = title_tag.text.strip() if title_tag else ""
-            
+            # タイトルとURLは同じタグから取得することが多い
             link_tag = article.find("a", href=True)
             url = link_tag["href"] if link_tag and link_tag["href"].startswith("https://news.yahoo.co.jp/articles/") else ""
+            
+            # タイトルは <a> タグの中、あるいは直近の div/h4 タグを探す
+            title_tag = link_tag.find("div", class_=re.compile("sc-3ls169-0")) if link_tag else None
+            if not title_tag:
+                 # タイトルテキストは <a> タグの直下の要素にあることが多い
+                 title_tag = link_tag.find('div') if link_tag else None
+                 
+            title = title_tag.text.strip() if title_tag else ""
             
             time_tag = article.find("time")
             date_str = time_tag.text.strip() if time_tag else ""
@@ -418,7 +443,11 @@ def process_and_update_yahoo_sheet(gc: gspread.Client):
         
         # フラグ: Gemini分析が必要か
         # 本文が入っており、かつ分析結果（G, H, I列）のいずれかが空欄の場合に実行
-        needs_analysis = not str(sentiment).strip() or not str(category).strip() or not str(relevance).strip()
+        needs_analysis = (not str(sentiment).strip() or 
+                          not str(category).strip() or 
+                          not str(relevance).strip() or
+                          # エラー値が残っている場合も再分析対象とする
+                          sentiment.strip().startswith("ERROR")) 
 
         # スキップ条件: 本文が既に入っていて、かつ分析結果もすべて入っている場合のみ
         if not needs_details and not needs_analysis:
@@ -454,29 +483,25 @@ def process_and_update_yahoo_sheet(gc: gspread.Client):
 
         if needs_analysis and article_body.strip(): # 本文があり、分析が必要な場合
             final_sentiment, final_category, final_relevance = analyze_with_gemini(article_body)
-            # API負荷軽減のための待機時間（リトライ処理で待機が入るため、ここでは短くするか、削除しても良いが、一応残す）
-            # リトライ処理が入ったため、ここは削除または短縮を検討
-            time.sleep(1 + random.random() * 0.5) 
+            time.sleep(1 + random.random() * 0.5) # API負荷軽減のための待機
         elif needs_analysis and not article_body.strip():
              # 本文が取れなかったが分析が必要な場合（エラーマーク）
              final_sentiment, final_category, final_relevance = "N/A(No Body)", "N/A", "0"
 
 
         # 3. 更新データを作成: [本文, コメント数, ポジネガ分類, カテゴリ分類, 関連度]
-        # 更新するのは、値が変わる可能性のある E, F, G, H, I のみ
-        # 既存の値を優先し、未入力の場合のみ取得した新しい値を使用するロジックを修正
-        new_body = article_body if not body.strip() else body
-        new_comment_count = final_comment_count if not str(comment_count).strip() or str(comment_count).strip() == '0' else comment_count
+        # 既存の値を優先し、未入力の場合のみ取得した新しい値を使用するロジックを維持しつつ、
+        # needs_analysisがTrueなら新しいGemini結果で上書きする
 
-        # Gemini結果は「分析が必要」と判定されたら、その結果で上書きする
-        if needs_analysis and article_body.strip():
+        # E, F列の更新
+        new_body = article_body if not body.strip() else body
+        new_comment_count = final_comment_count if (not str(comment_count).strip() or str(comment_count).strip() == '0') else comment_count
+
+        # G, H, I列の更新
+        if needs_analysis:
              new_sentiment = final_sentiment
              new_category = final_category
              new_relevance = final_relevance
-        elif needs_analysis and not article_body.strip():
-             new_sentiment = final_sentiment # N/A(No Body)
-             new_category = final_category # N/A
-             new_relevance = final_relevance # 0
         else: # 分析が必要ない場合は既存値を保持
              new_sentiment = sentiment
              new_category = category
@@ -492,7 +517,7 @@ def process_and_update_yahoo_sheet(gc: gspread.Client):
         # E列からI列までを一括で更新
         for r_num in rows_to_update:
             # E列からI列までの5列を更新するため、valuesは[E, F, G, H, I]のリスト
-            range_name = f'E{r_num}:I{r_num}' 
+            range_name = f'E{r_num}:I{r_num}'  
             updates_list.append({
                 'range': range_name,
                 'values': [updates_dict[r_num]] # 値は [ [E, F, G, H, I] ] の形式
