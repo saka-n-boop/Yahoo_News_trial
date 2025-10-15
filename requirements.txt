@@ -5,3 +5,4 @@ webdriver_manager
 beautifulsoup4
 requests
 google-genai
+google-api-core
