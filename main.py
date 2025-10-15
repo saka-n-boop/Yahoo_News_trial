@@ -27,6 +27,8 @@ from webdriver_manager.chrome import ChromeDriverManager
 # --- Gemini API 関連のインポート ---
 from google import genai
 from google.genai import types
+# ★ 追加 ★: エラー処理のために ResourceExhausted をインポート
+from google.api_core.exceptions import ResourceExhausted 
 # ------------------------------------
 
 # ====== 設定 ======
@@ -163,36 +165,53 @@ def analyze_with_gemini(text_to_analyze: str) -> Tuple[str, str, str]:
     if not prompt_template:
         return "ERROR(Prompt Missing)", "ERROR", "0"
 
-    try:
-        text_for_prompt = text_to_analyze[:3000]
-        
-        prompt = prompt_template.replace("{KEYWORD}", KEYWORD)
-        prompt = prompt.replace("{TEXT_TO_ANALYZE}", text_for_prompt)
-        
-        response = GEMINI_CLIENT.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema={"type": "object", "properties": {
-                    "sentiment": {"type": "string", "description": "ポジティブ、ニュートラル、ネガティブのいずれか"}, 
-                    "category": {"type": "string", "description": "企業、モデル、技術などの分類結果"}, 
-                    "relevance": {"type": "integer", "description": f"トヨタとの関連度を0から100の整数"}
-                }}
-            ),
-        )
+    MAX_RETRIES = 3
+    for attempt in range(MAX_RETRIES):
+        try:
+            text_for_prompt = text_to_analyze[:3000]
+            
+            prompt = prompt_template.replace("{KEYWORD}", KEYWORD)
+            prompt = prompt.replace("{TEXT_TO_ANALYZE}", text_for_prompt)
+            
+            response = GEMINI_CLIENT.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema={"type": "object", "properties": {
+                        "sentiment": {"type": "string", "description": "ポジティブ、ニュートラル、ネガティブのいずれか"}, 
+                        "category": {"type": "string", "description": "企業、モデル、技術などの分類結果"}, 
+                        "relevance": {"type": "integer", "description": f"トヨタとの関連度を0から100の整数"}
+                    }}
+                ),
+            )
 
-        analysis = json.loads(response.text.strip())
+            analysis = json.loads(response.text.strip())
+            
+            sentiment = analysis.get("sentiment", "N/A")
+            category = analysis.get("category", "N/A")
+            relevance = str(analysis.get("relevance", "0")) # Geminiの出力が数値でも str() で文字列に変換
+
+            return sentiment, category, relevance
+
+        # ★ 429 エラー (ResourceExhausted) の処理を追加 ★
+        except ResourceExhausted as e:
+            if attempt < MAX_RETRIES - 1:
+                wait_time = 2 ** attempt + random.random() # 1, 2, 4秒 + ランダムな揺らぎ
+                print(f"  🚨 Gemini API クォータ制限エラー (429)。{wait_time:.2f} 秒待機してリトライします (試行 {attempt + 1}/{MAX_RETRIES})。")
+                time.sleep(wait_time)
+                continue # 次の試行へ
+            else:
+                print(f"  ❌ Gemini分析エラー: {e}。最大試行回数 ({MAX_RETRIES} 回) に達しました。")
+                return "ERROR(Quota)", "ERROR", "0"
         
-        sentiment = analysis.get("sentiment", "N/A")
-        category = analysis.get("category", "N/A")
-        relevance = str(analysis.get("relevance", "0")) # Geminiの出力が数値でも str() で文字列に変換
-
-        return sentiment, category, relevance
-
-    except Exception as e:
-        print(f"Gemini分析エラー: {e}")
-        return "ERROR", "ERROR", "0"
+        # その他のエラー処理
+        except Exception as e:
+            print(f"Gemini分析エラー: {e}")
+            return "ERROR", "ERROR", "0"
+            
+    # ここに到達した場合（本来は到達しないが、フォールバックとして）
+    return "ERROR", "ERROR", "0"
 
 # ====== データ取得関数 ======
 
@@ -332,7 +351,7 @@ def write_and_sort_news_list_to_source(gc: gspread.Client, articles: list[dict])
     
     sh = gc.open_by_key(SOURCE_SPREADSHEET_ID)
     worksheet = ensure_source_sheet_headers(sh)
-            
+    
     existing_data = worksheet.get_all_values(value_render_option='UNFORMATTED_VALUE')
     existing_urls = set(row[0] for row in existing_data[1:] if len(row) > 0) 
     
@@ -435,7 +454,9 @@ def process_and_update_yahoo_sheet(gc: gspread.Client):
 
         if needs_analysis and article_body.strip(): # 本文があり、分析が必要な場合
             final_sentiment, final_category, final_relevance = analyze_with_gemini(article_body)
-            time.sleep(1 + random.random() * 0.5) # API負荷軽減のための待機
+            # API負荷軽減のための待機時間（リトライ処理で待機が入るため、ここでは短くするか、削除しても良いが、一応残す）
+            # リトライ処理が入ったため、ここは削除または短縮を検討
+            time.sleep(1 + random.random() * 0.5) 
         elif needs_analysis and not article_body.strip():
              # 本文が取れなかったが分析が必要な場合（エラーマーク）
              final_sentiment, final_category, final_relevance = "N/A(No Body)", "N/A", "0"
