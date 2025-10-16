@@ -36,7 +36,7 @@ from google.api_core.exceptions import ResourceExhausted
 # ====== 設定 ======
 # ★指定されたスプレッドシートIDを使用
 SHARED_SPREADSHEET_ID = "1Ru2DT_zzKjTJptchWJitCb67VoffImGhgeOVjwlKukc"
-KEYWORD = "トヨタ"
+KEYWORD = "トヨタ" # ★キーワードはトヨタのまま維持
 SOURCE_SPREADSHEET_ID = SHARED_SPREADSHEET_ID
 SOURCE_SHEET_NAME = "Yahoo"
 DEST_SPREADSHEET_ID = SHARED_SPREADSHEET_ID
@@ -168,7 +168,7 @@ def analyze_with_gemini(text_to_analyze: str) -> Tuple[str, str, str]:
         return "ERROR(Prompt Missing)", "ERROR", "0"
 
     MAX_RETRIES = 3 
-    # ★★★ 修正箇所: 最大文字数を15000に設定 ★★★
+    # ★★★ 最大文字数を15000に設定 ★★★
     MAX_CHARACTERS = 15000 
     # ------------------------------------------
 
@@ -243,19 +243,17 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
     
     # 記事リストが表示されるまで最大10秒待機する処理を追加 (安定性向上)
     try:
-        # 最新のクラス名 'sc-1u4589e-0' を含む要素が出現するまで待機
         WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "li[class*='sc-1u4589e-0']"))
         )
         print("  記事リスト要素の読み込みを確認しました。")
     except Exception:
         print("  警告: 記事リスト要素の表示に時間がかかっています。5秒待機します。")
-        time.sleep(5) # 待機失敗の場合のフォールバック
+        time.sleep(5) 
     
     soup = BeautifulSoup(driver.page_source, "html.parser")
     driver.quit()
     
-    # 記事コンテナのセレクタを最新の構造に統一
     articles = soup.find_all("li", class_=re.compile("sc-1u4589e-0"))
     
     articles_data = []
@@ -269,28 +267,31 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
             link_tag = article.find("a", href=True)
             url = link_tag["href"] if link_tag and link_tag["href"].startswith("https://news.yahoo.co.jp/articles/") else ""
             
-            # 投稿日時の取得ロジック
+            # 投稿日時の取得ロジックの強化
+            date_str = ""
             time_tag = article.find("time")
-            # timeタグが直接見つからなかった場合、ソース/日付のコンテナクラスを検索して再検索
-            if not time_tag:
+            if time_tag:
+                date_str = time_tag.text.strip()
+            else:
+                # 日付とソースのコンテナを広く探して、その中のテキストから抽出を試みる (フォールバック)
                 source_container = article.find("div", class_=re.compile("sc-n3vj8g-0"))
                 if source_container:
-                    time_tag = source_container.find("time") 
-            
-            date_str = time_tag.text.strip() if time_tag else ""
-            
-            # ソースの取得ロジック
+                    # div.sc-n3vj8g-0 のテキスト全体から日付パターンを探す
+                    date_source_text = source_container.get_text(strip=True)
+                    # MM/DD(曜日)HH:MM のパターンを正規表現で抽出
+                    match = re.search(r'(\d{1,2}/\d{1,2}\([月火水木金土日]\)\d{1,2}:\d{2})', date_source_text)
+                    if match:
+                         date_str = match.group(1)
+
+            # ソースの取得ロジック (変更なし)
             source_text = ""
-            # クラス名 'sc-n3vj8g-0' と 'sc-110wjhy-8' を使用して取得
             source_container = article.find("div", class_=re.compile("sc-n3vj8g-0"))
             if source_container:
                 inner = source_container.find("div", class_=re.compile("sc-110wjhy-8"))
                 if inner and inner.span:
-                    # inner.spanが最初の要素（ソース名）であることを利用
                     candidate_span = inner.find('span') 
                     if candidate_span:
                         candidate = candidate_span.text.strip()
-                        # コメント数アイコン(数字)でないことを確認
                         if not candidate.isdigit():
                             source_text = candidate
 
@@ -302,13 +303,13 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
                         dt_obj = parse_post_date(date_str_clean, jst_now())
                         if dt_obj:
                             formatted_date = format_datetime(dt_obj)
+                        
                     except:
-                            formatted_date = date_str
+                        formatted_date = date_str
 
                 articles_data.append({
                     "URL": url,
                     "タイトル": title,
-                    # ★ 取得不可の場合は「取得不可」を入れておき、後で本文から補完する
                     "投稿日時": formatted_date if formatted_date else "取得不可", 
                     "ソース": source_text
                 })
@@ -322,7 +323,7 @@ def fetch_article_body_and_comments(base_url: str) -> Tuple[str, int, Optional[s
     """ 記事本文、コメント数、および記事本文から抽出した日時を返す """
     body_text = ""
     comment_count = 0
-    extracted_date_str = None # ★ 新しく追加
+    extracted_date_str = None 
 
     try:
         res = requests.get(base_url, headers=REQ_HEADERS, timeout=20)
@@ -330,25 +331,32 @@ def fetch_article_body_and_comments(base_url: str) -> Tuple[str, int, Optional[s
         soup = BeautifulSoup(res.text, "html.parser")
         
         # 記事本文の取得
-        article = soup.find("article")
-        if article:
-            ps = article.find_all("p")
-            # 最初の数段落を結合して日時抽出に使う
-            body_text_partial = " ".join(p.get_text(strip=True) for p in ps[:3] if p.get_text(strip=True))
-            body_text = "\n".join(p.get_text(strip=True) for p in ps if p.get_text(strip=True))
-            
-            # ★ 修正点1: 記事本文の冒頭から配信日時を抽出 ★
-            # 例: 10/15(水)19:10配信 または 10/15(水) 19:10配信
-            match = re.search(r'(\d{1,2}/\d{1,2})\([月火水木金土日]\)(\s*)(\d{1,2}:\d{2})配信', body_text_partial)
-            if match:
-                month_day = match.group(1)
-                time_str = match.group(3)
-                
-                # 'MM/DD HH:MM' の形式に変換
-                extracted_date_str = f"{month_day} {time_str}"
-            # ----------------------------------------------------
+        article_content = soup.find("article") # 最初にarticleタグを探す
         
-        # コメント数の取得
+        # ★ 修正点3: 本文がない場合のフォールバックセレクタの追加 ★
+        if not article_content:
+            # 記事本文の主要なコンテナクラスを探す
+            article_content = soup.find("div", class_="article_body") 
+            if not article_content:
+                # 別の一般的なクラスを探す（Yahooニュースの構成に合わせる）
+                article_content = soup.find("div", class_=re.compile("article_detail")) 
+
+        if article_content:
+            ps = article_content.find_all("p")
+            
+            if ps:
+                # 最初の数段落を結合して日時抽出に使う
+                body_text_partial = " ".join(p.get_text(strip=True) for p in ps[:3] if p.get_text(strip=True))
+                body_text = "\n".join(p.get_text(strip=True) for p in ps if p.get_text(strip=True))
+                
+                # 記事本文の冒頭から配信日時を抽出
+                match = re.search(r'(\d{1,2}/\d{1,2})\([月火水木金土日]\)(\s*)(\d{1,2}:\d{2})配信', body_text_partial)
+                if match:
+                    month_day = match.group(1)
+                    time_str = match.group(3)
+                    extracted_date_str = f"{month_day} {time_str}"
+        
+        # コメント数の取得 (変更なし)
         comment_button = soup.find("button", attrs={"data-cl-params": re.compile(r"cmtmod")})
         
         if comment_button:
@@ -367,7 +375,7 @@ def fetch_article_body_and_comments(base_url: str) -> Tuple[str, int, Optional[s
     except Exception as e:
         print(f"    ! 詳細取得エラー: {e}")
         
-    return body_text, comment_count, extracted_date_str # ★ 戻り値に追加
+    return body_text, comment_count, extracted_date_str
 
 
 # ====== スプレッドシート操作関数 ======
@@ -390,8 +398,9 @@ def write_and_sort_news_list_to_source(gc: gspread.Client, articles: list[dict])
     sh = gc.open_by_key(SOURCE_SPREADSHEET_ID)
     worksheet = ensure_source_sheet_headers(sh)
             
+    # ★ 致命的なエラー修正: 読み込み時に全て文字列化する
     existing_data = worksheet.get_all_values(value_render_option='UNFORMATTED_VALUE')
-    existing_urls = set(row[0] for row in existing_data[1:] if len(row) > 0) 
+    existing_urls = set(str(row[0]) for row in existing_data[1:] if len(row) > 0) 
     
     new_data = [[a['URL'], a['タイトル'], a['投稿日時'], a['ソース']] for a in articles if a['URL'] not in existing_urls]
     
@@ -399,15 +408,15 @@ def write_and_sort_news_list_to_source(gc: gspread.Client, articles: list[dict])
         worksheet.append_rows(new_data, value_input_option='USER_ENTERED')
         print(f" SOURCEシートに {len(new_data)} 件追記しました。")
         
-        all_values = worksheet.get_all_values()
+        all_values = worksheet.get_all_values(value_render_option='UNFORMATTED_VALUE')
         header = all_values[0]
         rows = all_values[1:]
         
         now = jst_now()
         def sort_key(row):
-            # 投稿日時 (C列) でソート
+            # 投稿日時 (C列) でソート。ソートキー生成時にも文字列に変換。
             if len(row) > 2:
-                dt = parse_post_date(row[2], now)
+                dt = parse_post_date(str(row[2]), now)
                 # 日時が取得できない場合は一番古いものとして扱う
                 return dt if dt else datetime.max.replace(tzinfo=TZ_JST) 
             else:
@@ -443,24 +452,25 @@ def process_and_update_yahoo_sheet(gc: gspread.Client):
     for idx, data_row in enumerate(data_rows):
         row_num = idx + 2 
         
-        # A-D列の値を取得
-        url = data_row[0] if len(data_row) > 0 else ""
-        title = data_row[1] if len(data_row) > 1 else "不明"
-        post_date_raw = data_row[2] if len(data_row) > 2 else "" # C列の元の投稿日時
-        source = data_row[3] if len(data_row) > 3 else ""         # D列の元のソース
+        # ★★★ 致命的なエラー修正: スプレッドシートからの値は必ず文字列化する ★★★
+        url = str(data_row[0]) if len(data_row) > 0 else ""
+        title = str(data_row[1]) if len(data_row) > 1 else "不明"
+        post_date_raw = str(data_row[2]) if len(data_row) > 2 else "" # C列の元の投稿日時
+        source = str(data_row[3]) if len(data_row) > 3 else ""         # D列の元のソース
         
         # E-I列の値を取得
-        body = data_row[4] if len(data_row) > 4 else ""  
-        comment_count = data_row[5] if len(data_row) > 5 else ""  
-        sentiment = data_row[6] if len(data_row) > 6 else ""
-        category = data_row[7] if len(data_row) > 7 else ""
-        relevance = data_row[8] if len(data_row) > 8 else ""
+        body = str(data_row[4]) if len(data_row) > 4 else ""  
+        comment_count = str(data_row[5]) if len(data_row) > 5 else ""  
+        sentiment = str(data_row[6]) if len(data_row) > 6 else ""
+        category = str(data_row[7]) if len(data_row) > 7 else ""
+        relevance = str(data_row[8]) if len(data_row) > 8 else ""
+        # ----------------------------------------------------------------------
 
         # フラグ: 本文、コメント数、または日時が必要か (C, E, F列の更新が必要な場合)
-        needs_details = not body.strip() or not str(comment_count).strip() or "取得不可" in post_date_raw or not post_date_raw.strip()
+        needs_details = not body.strip() or not comment_count.strip() or "取得不可" in post_date_raw or not post_date_raw.strip()
         
         # フラグ: Gemini分析が必要か (G, H, I列の更新が必要な場合)
-        needs_analysis = not str(sentiment).strip() or not str(category).strip() or not str(relevance).strip()
+        needs_analysis = not sentiment.strip() or not category.strip() or not relevance.strip()
 
         # スキップ条件: すべてのデータが揃っている場合
         if not needs_details and not needs_analysis:
@@ -485,7 +495,7 @@ def process_and_update_yahoo_sheet(gc: gspread.Client):
                 article_body = fetched_body
             
             # コメント数の補完
-            if not str(final_comment_count).strip() or str(final_comment_count).strip() == '0':
+            if not final_comment_count.strip() or final_comment_count.strip() == '0':
                 final_comment_count = fetched_comment_count
             
             # ★ 投稿日時の補完 (C列) ★
