@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-統合スクリプト（トヨタ版） - 最終設定バージョン：
-1. Yahooシートに記事リストを追記し、投稿日の古い順に並び替え (A-D列)。
-2. YahooシートのC-I列に対し、本文、コメント数、日時補完、Gemini分析を実行し、空欄があれば更新。
+統合スクリプト（国内8社対応版） - 最終設定バージョン：
+1. keywords.txtから全メーカーを読み込み、順次Yahooシートに記事リストを追記し、投稿日の古い順に並び替え (A-D列)。
+2. YahooシートのC-I列に対し、本文、コメント数、日時補完、Gemini分析（対象企業特定）を実行し、空欄があれば更新。
 """
 
 import os
@@ -36,12 +36,13 @@ from google.api_core.exceptions import ResourceExhausted
 # ====== 設定 ======
 # ★指定されたスプレッドシートIDを使用
 SHARED_SPREADSHEET_ID = "1Ru2DT_zzKjTJptchWJitCb67VoffImGhgeOVjwlKukc"
-KEYWORD = "トヨタ" # ★キーワードはトヨタのまま維持
+# KEYWORD = "トヨタ" # 単一キーワードを削除
+KEYWORD_FILE = "keywords.txt" # ★ 追加: キーワードリストファイル名
 SOURCE_SPREADSHEET_ID = SHARED_SPREADSHEET_ID
 SOURCE_SHEET_NAME = "Yahoo"
 DEST_SPREADSHEET_ID = SHARED_SPREADSHEET_ID
 # 新しいヘッダー構成
-YAHOO_SHEET_HEADERS = ["URL", "タイトル", "投稿日時", "ソース", "本文", "コメント数", "ポジネガ分類", "カテゴリ分類", "関連度"]
+YAHOO_SHEET_HEADERS = ["URL", "タイトル", "投稿日時", "ソース", "本文", "コメント数", "ポジネガ分類", "カテゴリ分類", "対象企業"] # ★ I列のヘッダーを変更
 MAX_BODY_PAGES = 1
 REQ_HEADERS = {"User-Agent": "Mozilla/5.0"}
 TZ_JST = timezone(timedelta(hours=9))
@@ -51,7 +52,7 @@ PROMPT_FILES = [
     "prompt_gemini_role.txt",
     "prompt_posinega.txt",
     "prompt_category.txt",
-    "prompt_score.txt"
+    "prompt_target_company.txt" # ★ ファイル名を変更
 ]
 
 # --- Gemini クライアントの初期化 ---
@@ -80,12 +81,10 @@ def parse_post_date(raw, today_jst: datetime) -> Optional[datetime]:
         s = raw.strip()
         s = re.sub(r"\([月火水木金土日]\)$", "", s).strip()
         s = s.strip()
-        # 記事本文からの抽出形式: "MM/DD HH:MM"
         for fmt in ("%y/%m/%d %H:%M", "%m/%d %H:%M", "%Y/%m/%d %H:%M", "%Y/%m/%d %H:%M:%S"):
             try:
                 dt = datetime.strptime(s, fmt)
                 if fmt == "%m/%d %H:%M":
-                    # 年がない場合は今年の年を補完する
                     dt = dt.replace(year=today_jst.year)
                 return dt.replace(tzinfo=TZ_JST)
             except ValueError:
@@ -108,6 +107,23 @@ def build_gspread_client() -> gspread.Client:
     except Exception as e:
         raise RuntimeError(f"Google認証に失敗: {e}")
 
+def load_keywords(filename: str) -> List[str]:
+    """ ファイルから検索キーワードリストを読み込む """
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        file_path = os.path.join(script_dir, filename)
+        with open(file_path, 'r', encoding='utf-8') as f:
+            keywords = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+        if not keywords:
+            raise ValueError("キーワードファイルに有効なキーワードが含まれていません。")
+        return keywords
+    except FileNotFoundError:
+        print(f"致命的エラー: キーワードファイル '{filename}' が見つかりません。")
+        return []
+    except Exception as e:
+        print(f"キーワードファイルの読み込みエラー: {e}")
+        return []
+
 def load_gemini_prompt() -> str:
     """ 4つのプロンプトファイルを読み込み、テンプレートを結合して返す """
     global GEMINI_PROMPT_TEMPLATE
@@ -118,14 +134,15 @@ def load_gemini_prompt() -> str:
     
     try:
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        
-        # 1. ロール設定ファイル (prompt_gemini_role.txt) を最初に読み込む
+        role_instruction = ""
+
+        # ロール設定ファイル (最初のファイル) を読み込む
         role_file = PROMPT_FILES[0]
         file_path = os.path.join(script_dir, role_file)
         with open(file_path, 'r', encoding='utf-8') as f:
             role_instruction = f.read().strip()
         
-        # 2. 残りの分類ルールファイルを読み込む
+        # 残りの分類ルールファイルを読み込む
         for filename in PROMPT_FILES[1:]:
             file_path = os.path.join(script_dir, filename)
             with open(file_path, 'r', encoding='utf-8') as f:
@@ -157,28 +174,27 @@ def load_gemini_prompt() -> str:
 # ====== Gemini 分析関数 ======
 
 def analyze_with_gemini(text_to_analyze: str) -> Tuple[str, str, str]:
+    # 戻り値は (sentiment, category, company_info) の3つ
     if not GEMINI_CLIENT:
-        return "N/A", "N/A", "0"
+        return "N/A", "N/A", "N/A"
         
     if not text_to_analyze.strip():
-        return "N/A", "N/A", "0"
+        return "N/A", "N/A", "N/A"
 
     prompt_template = load_gemini_prompt()
     if not prompt_template:
-        return "ERROR(Prompt Missing)", "ERROR", "0"
+        return "ERROR(Prompt Missing)", "ERROR", "ERROR"
 
     MAX_RETRIES = 3 
-    # ★★★ 最大文字数を15000に設定 ★★★
     MAX_CHARACTERS = 15000 
-    # ------------------------------------------
-
+    
     for attempt in range(MAX_RETRIES):
         try:
-            # 記事本文を指定文字数に制限
             text_for_prompt = text_to_analyze[:MAX_CHARACTERS]
             
-            prompt = prompt_template.replace("{KEYWORD}", KEYWORD)
-            prompt = prompt.replace("{TEXT_TO_ANALYZE}", text_for_prompt)
+            # KEYWORDは、検索キーワードではなく、ロール設定にのみ使用されるため、ここでは置換不要。
+            # 検索キーワードでなくても、ターゲット企業を分析させるため。
+            prompt = prompt_template.replace("{TEXT_TO_ANALYZE}", text_for_prompt)
             
             response = GEMINI_CLIENT.models.generate_content(
                 model='gemini-2.5-flash',
@@ -188,7 +204,7 @@ def analyze_with_gemini(text_to_analyze: str) -> Tuple[str, str, str]:
                     response_schema={"type": "object", "properties": {
                         "sentiment": {"type": "string", "description": "ポジティブ、ニュートラル、ネガティブのいずれか"}, 
                         "category": {"type": "string", "description": "企業、モデル、技術などの分類結果"}, 
-                        "relevance": {"type": "integer", "description": f"{KEYWORD}との関連度を0から100の整数"}
+                        "company_info": {"type": "string", "description": "記事の主題企業名と（）内に共同開発企業名を記載した結果"} # ★ JSONスキーマのキー名を変更
                     }}
                 ),
             )
@@ -197,14 +213,13 @@ def analyze_with_gemini(text_to_analyze: str) -> Tuple[str, str, str]:
             
             sentiment = analysis.get("sentiment", "N/A")
             category = analysis.get("category", "N/A")
-            relevance = str(analysis.get("relevance", "0"))
+            company_info = analysis.get("company_info", "N/A") # ★ 取得するキー名を変更
 
-            return sentiment, category, relevance
+            return sentiment, category, company_info
 
         except ResourceExhausted as e:
-            # クォータ制限エラーの場合、リトライせずに終了
             print(f"  🚨 Gemini API クォータ制限エラー (429): {e}")
-            return "ERROR(Quota)", "ERROR", "0"
+            return "ERROR(Quota)", "ERROR", "ERROR"
 
         except Exception as e:
             if attempt < MAX_RETRIES - 1:
@@ -214,14 +229,14 @@ def analyze_with_gemini(text_to_analyze: str) -> Tuple[str, str, str]:
                 continue
             else:
                 print(f"Gemini分析エラー: {e}")
-                return "ERROR", "ERROR", "0"
-    return "ERROR", "ERROR", "0"
+                return "ERROR", "ERROR", "ERROR"
+    return "ERROR", "ERROR", "ERROR"
 
 # ====== データ取得関数 ======
 
 def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
     # A-D列（URL, タイトル, 投稿日時, ソース）のデータを取得
-    print("  Yahoo!ニュース検索開始...")
+    print(f"  Yahoo!ニュース検索開始 (キーワード: {keyword})...")
     options = Options()
     options.add_argument("--headless=new") 
     options.add_argument("--disable-gpu")
@@ -241,7 +256,6 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
     search_url = f"https://news.yahoo.co.jp/search?p={keyword}&ei=utf-8&categories=domestic,world,business,it,science,life,local"
     driver.get(search_url)
     
-    # 記事リストが表示されるまで最大10秒待機する処理を追加 (安定性向上)
     try:
         WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "li[class*='sc-1u4589e-0']"))
@@ -260,30 +274,24 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
     
     for article in articles:
         try:
-            # タイトルは div.sc-3ls169-0 の子要素として取得
             title_tag = article.find("div", class_=re.compile("sc-3ls169-0"))
             title = title_tag.text.strip() if title_tag else ""
             
             link_tag = article.find("a", href=True)
             url = link_tag["href"] if link_tag and link_tag["href"].startswith("https://news.yahoo.co.jp/articles/") else ""
             
-            # 投稿日時の取得ロジックの強化
             date_str = ""
             time_tag = article.find("time")
             if time_tag:
                 date_str = time_tag.text.strip()
             else:
-                # 日付とソースのコンテナを広く探して、その中のテキストから抽出を試みる (フォールバック)
                 source_container = article.find("div", class_=re.compile("sc-n3vj8g-0"))
                 if source_container:
-                    # div.sc-n3vj8g-0 のテキスト全体から日付パターンを探す
                     date_source_text = source_container.get_text(strip=True)
-                    # MM/DD(曜日)HH:MM のパターンを正規表現で抽出
                     match = re.search(r'(\d{1,2}/\d{1,2}\([月火水木金土日]\)\d{1,2}:\d{2})', date_source_text)
                     if match:
                          date_str = match.group(1)
 
-            # ソースの取得ロジック (変更なし)
             source_text = ""
             source_container = article.find("div", class_=re.compile("sc-n3vj8g-0"))
             if source_container:
@@ -316,7 +324,7 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
         except Exception as e:
             continue
             
-    print(f" Yahoo!ニュース件数: {len(articles_data)} 件取得")
+    print(f"  Yahoo!ニュース件数: {len(articles_data)} 件取得")
     return articles_data
 
 def fetch_article_body_and_comments(base_url: str) -> Tuple[str, int, Optional[str]]:
@@ -331,25 +339,20 @@ def fetch_article_body_and_comments(base_url: str) -> Tuple[str, int, Optional[s
         soup = BeautifulSoup(res.text, "html.parser")
         
         # 記事本文の取得
-        article_content = soup.find("article") # 最初にarticleタグを探す
+        article_content = soup.find("article") 
         
-        # ★ 修正点3: 本文がない場合のフォールバックセレクタの追加 ★
         if not article_content:
-            # 記事本文の主要なコンテナクラスを探す
             article_content = soup.find("div", class_="article_body") 
             if not article_content:
-                # 別の一般的なクラスを探す（Yahooニュースの構成に合わせる）
                 article_content = soup.find("div", class_=re.compile("article_detail")) 
 
         if article_content:
             ps = article_content.find_all("p")
             
             if ps:
-                # 最初の数段落を結合して日時抽出に使う
                 body_text_partial = " ".join(p.get_text(strip=True) for p in ps[:3] if p.get_text(strip=True))
                 body_text = "\n".join(p.get_text(strip=True) for p in ps if p.get_text(strip=True))
                 
-                # 記事本文の冒頭から配信日時を抽出
                 match = re.search(r'(\d{1,2}/\d{1,2})\([月火水木金土日]\)(\s*)(\d{1,2}:\d{2})配信', body_text_partial)
                 if match:
                     month_day = match.group(1)
@@ -392,13 +395,12 @@ def ensure_source_sheet_headers(sh: gspread.Spreadsheet) -> gspread.Worksheet:
         ws.update(range_name=f'A1:{gspread.utils.rowcol_to_a1(1, len(YAHOO_SHEET_HEADERS))}', values=[YAHOO_SHEET_HEADERS])
     return ws
 
-def write_and_sort_news_list_to_source(gc: gspread.Client, articles: list[dict]):
-    """ ① Yahooシートに記事を追記し、② 古い順に並び替える """
+def write_news_list_to_source(gc: gspread.Client, articles: list[dict]):
+    """ Yahooシートに記事を追記する (ソートは別関数で行う) """
     
     sh = gc.open_by_key(SOURCE_SPREADSHEET_ID)
     worksheet = ensure_source_sheet_headers(sh)
             
-    # ★ 致命的なエラー修正: 読み込み時に全て文字列化する
     existing_data = worksheet.get_all_values(value_render_option='UNFORMATTED_VALUE')
     existing_urls = set(str(row[0]) for row in existing_data[1:] if len(row) > 0) 
     
@@ -406,41 +408,55 @@ def write_and_sort_news_list_to_source(gc: gspread.Client, articles: list[dict])
     
     if new_data:
         worksheet.append_rows(new_data, value_input_option='USER_ENTERED')
-        print(f" SOURCEシートに {len(new_data)} 件追記しました。")
-        
-        all_values = worksheet.get_all_values(value_render_option='UNFORMATTED_VALUE')
-        header = all_values[0]
-        rows = all_values[1:]
-        
-        now = jst_now()
-        def sort_key(row):
-            # 投稿日時 (C列) でソート。ソートキー生成時にも文字列に変換。
-            if len(row) > 2:
-                dt = parse_post_date(str(row[2]), now)
-                # 日時が取得できない場合は一番古いものとして扱う
-                return dt if dt else datetime.max.replace(tzinfo=TZ_JST) 
-            else:
-                return datetime.max.replace(tzinfo=TZ_JST)
-            
-        sorted_rows = sorted(rows, key=sort_key) 
-        
-        full_data_to_write = [header] + sorted_rows
-        range_end = gspread.utils.rowcol_to_a1(len(full_data_to_write), len(YAHOO_SHEET_HEADERS))
-        
-        # 並び替えたデータをシートに書き戻す
-        worksheet.update(values=full_data_to_write, range_name=f'A1:{range_end}', value_input_option='USER_ENTERED')
-        
-        print(" SOURCEシートを投稿日時の古い順に並び替えました。")
+        print(f"  SOURCEシートに {len(new_data)} 件追記しました。")
     else:
-        print(" SOURCEシートに追記すべき新しいデータはありません。")
+        print("  SOURCEシートに追記すべき新しいデータはありません。")
+
+def sort_yahoo_sheet(gc: gspread.Client):
+    """ Yahooシートを投稿日の古い順に並び替える """
+    sh = gc.open_by_key(SOURCE_SPREADSHEET_ID)
+    try:
+        worksheet = sh.worksheet(SOURCE_SHEET_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        print("ソートスキップ: Yahooシートが見つかりません。")
+        return
+
+    all_values = worksheet.get_all_values(value_render_option='UNFORMATTED_VALUE')
+    if len(all_values) <= 1:
+        return
+        
+    header = all_values[0]
+    rows = all_values[1:]
+    
+    now = jst_now()
+    def sort_key(row):
+        # 投稿日時 (C列) でソート。ソートキー生成時にも文字列に変換。
+        if len(row) > 2:
+            dt = parse_post_date(str(row[2]), now)
+            return dt if dt else datetime.max.replace(tzinfo=TZ_JST) 
+        else:
+            return datetime.max.replace(tzinfo=TZ_JST)
+        
+    sorted_rows = sorted(rows, key=sort_key) 
+    
+    full_data_to_write = [header] + sorted_rows
+    range_end = gspread.utils.rowcol_to_a1(len(full_data_to_write), len(YAHOO_SHEET_HEADERS))
+    
+    worksheet.update(values=full_data_to_write, range_name=f'A1:{range_end}', value_input_option='USER_ENTERED')
+    
+    print(" SOURCEシートを投稿日時の古い順に並び替えました。")
 
 
 def process_and_update_yahoo_sheet(gc: gspread.Client):
     """ C～I列が未入力の行に対し、詳細取得とGemini分析を実行する """
     
     sh = gc.open_by_key(SOURCE_SPREADSHEET_ID)
-    ws = sh.worksheet(SOURCE_SHEET_NAME)
-    
+    try:
+        ws = sh.worksheet(SOURCE_SHEET_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        print("詳細取得・分析スキップ: Yahooシートが見つかりません。")
+        return
+        
     all_values = ws.get_all_values(value_render_option='UNFORMATTED_VALUE')
     if len(all_values) <= 1:
         print(" Yahooシートにデータがないため、詳細取得・分析をスキップします。")
@@ -452,7 +468,7 @@ def process_and_update_yahoo_sheet(gc: gspread.Client):
     for idx, data_row in enumerate(data_rows):
         row_num = idx + 2 
         
-        # ★★★ 致命的なエラー修正: スプレッドシートからの値は必ず文字列化する ★★★
+        # A-D列の値を取得
         url = str(data_row[0]) if len(data_row) > 0 else ""
         title = str(data_row[1]) if len(data_row) > 1 else "不明"
         post_date_raw = str(data_row[2]) if len(data_row) > 2 else "" # C列の元の投稿日時
@@ -463,16 +479,15 @@ def process_and_update_yahoo_sheet(gc: gspread.Client):
         comment_count = str(data_row[5]) if len(data_row) > 5 else ""  
         sentiment = str(data_row[6]) if len(data_row) > 6 else ""
         category = str(data_row[7]) if len(data_row) > 7 else ""
-        relevance = str(data_row[8]) if len(data_row) > 8 else ""
-        # ----------------------------------------------------------------------
+        company_info = str(data_row[8]) if len(data_row) > 8 else ""   # ★ I列のデータ (旧: relevance)
 
         # フラグ: 本文、コメント数、または日時が必要か (C, E, F列の更新が必要な場合)
         needs_details = not body.strip() or not comment_count.strip() or "取得不可" in post_date_raw or not post_date_raw.strip()
         
         # フラグ: Gemini分析が必要か (G, H, I列の更新が必要な場合)
-        needs_analysis = not sentiment.strip() or not category.strip() or not relevance.strip()
+        # company_info (I列) が空かチェック
+        needs_analysis = not sentiment.strip() or not category.strip() or not company_info.strip()
 
-        # スキップ条件: すべてのデータが揃っている場合
         if not needs_details and not needs_analysis:
             continue
             
@@ -487,59 +502,52 @@ def process_and_update_yahoo_sheet(gc: gspread.Client):
         final_comment_count = comment_count
         final_post_date = post_date_raw
 
-        if needs_details or not article_body.strip(): # 本文が空か、詳細取得が必要な場合
+        if needs_details or not article_body.strip():
             fetched_body, fetched_comment_count, extracted_date = fetch_article_body_and_comments(url) 
             
-            # 本文の補完
             if not article_body.strip():
                 article_body = fetched_body
             
-            # コメント数の補完
             if not final_comment_count.strip() or final_comment_count.strip() == '0':
                 final_comment_count = fetched_comment_count
             
-            # ★ 投稿日時の補完 (C列) ★
             if ("取得不可" in final_post_date or not final_post_date.strip()) and extracted_date:
                 dt_obj = parse_post_date(extracted_date, jst_now())
                 if dt_obj:
                     final_post_date = format_datetime(dt_obj)
                 else:
-                    final_post_date = extracted_date # フォーマット失敗なら生データを入れておく
+                    final_post_date = extracted_date
 
         
         # --- Gemini分析を実行 (G, H, I列) ---
         final_sentiment = sentiment
         final_category = category
-        final_relevance = relevance
+        final_company_info = company_info 
 
-        if needs_analysis and article_body.strip(): # 本文があり、分析が必要な場合
-            final_sentiment, final_category, final_relevance = analyze_with_gemini(article_body)
-            time.sleep(1 + random.random() * 0.5) # API負荷軽減のための待機
+        if needs_analysis and article_body.strip(): 
+            final_sentiment, final_category, final_company_info = analyze_with_gemini(article_body) # ★ 戻り値が company_info
+            time.sleep(1 + random.random() * 0.5)
         elif needs_analysis and not article_body.strip():
-             # 本文が取れなかったが分析が必要な場合（エラーマーク）
-             final_sentiment, final_category, final_relevance = "N/A(No Body)", "N/A", "0"
+             final_sentiment, final_category, final_company_info = "N/A(No Body)", "N/A", "N/A"
 
         
         # --- 最終的な更新データ ---
-        # 本文とコメント数 (E, F列)
         new_body = article_body
         new_comment_count = final_comment_count
-
-        # 分析結果 (G, H, I列)
         new_sentiment = final_sentiment
         new_category = final_category
-        new_relevance = final_relevance
+        new_company_info = final_company_info # ★ I列に書き込む値
 
 
         # 最終的な更新データ (C列からI列まで)
         updates_dict[row_num] = [
             final_post_date, # C列 (投稿日時)
-            source,          # D列 (ソース) - 変更なし
+            source,          # D列 (ソース)
             new_body,        # E列 (本文)
             new_comment_count, # F列 (コメント数)
             new_sentiment,   # G列 (ポジネガ)
             new_category,    # H列 (カテゴリ)
-            new_relevance    # I列 (関連度)
+            new_company_info # I列 (対象企業)
         ]
 
 
@@ -547,7 +555,6 @@ def process_and_update_yahoo_sheet(gc: gspread.Client):
         updates_list = []
         rows_to_update = sorted(updates_dict.keys())
         
-        # C列からI列までを一括で更新
         for r_num in rows_to_update:
             range_name = f'C{r_num}:I{r_num}' 
             updates_list.append({
@@ -566,17 +573,29 @@ def process_and_update_yahoo_sheet(gc: gspread.Client):
 def main():
     print("--- 統合スクリプト開始 ---")
     
+    # ★ 1. キーワードリストを読み込む
+    keywords = load_keywords(KEYWORD_FILE)
+    if not keywords:
+        return
+
     try:
         gc = build_gspread_client()
     except RuntimeError as e:
         print(f"致命的エラー: {e}")
         return
     
-    # 1. Yahooシートに記事リストを追記し、投稿日の古い順に並び替え (A-D列を更新)
-    yahoo_news_articles = get_yahoo_news_with_selenium(KEYWORD)
-    write_and_sort_news_list_to_source(gc, yahoo_news_articles)
+    # 2. 全メーカーの記事取得をループ実行
+    for current_keyword in keywords:
+        print(f"\n===== 🔑 キーワード処理開始: {current_keyword} =====")
+        
+        # 1.1 Yahooシートに記事リストを追記 (A-D列を更新)
+        yahoo_news_articles = get_yahoo_news_with_selenium(current_keyword)
+        write_news_list_to_source(gc, yahoo_news_articles)
+        
+    # 3. 全ての記事が追記された後、ソートを実行
+    sort_yahoo_sheet(gc)
     
-    # 2. YahooシートのE-I列に対し、本文、コメント数、日時補完、Gemini分析を実行し、空欄があれば更新。
+    # 4. 全ての記事に対して詳細取得とGemini分析を実行 (C, E-I列を更新)
     process_and_update_yahoo_sheet(gc)
     
     print("\n--- 統合スクリプト終了 ---")
