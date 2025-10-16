@@ -2,7 +2,7 @@
 """
 統合スクリプト（トヨタ版） - 最終設定バージョン：
 1. Yahooシートに記事リストを追記し、投稿日の古い順に並び替え (A-D列)。
-2. YahooシートのE-I列に対し、本文、コメント数、Gemini分析を実行し、空欄があれば更新。
+2. YahooシートのC-I列に対し、本文、コメント数、日時補完、Gemini分析を実行し、空欄があれば更新。
 """
 
 import os
@@ -74,20 +74,23 @@ def format_datetime(dt_obj) -> str:
     return dt_obj.strftime("%y/%m/%d %H:%M")
 
 def parse_post_date(raw, today_jst: datetime) -> Optional[datetime]:
+    """ rawの日時文字列をdatetimeオブジェクトに変換。年がない場合は今年を補完。 """
     if raw is None: return None
     if isinstance(raw, str):
         s = raw.strip()
         s = re.sub(r"\([月火水木金土日]\)$", "", s).strip()
         s = s.strip()
+        # 記事本文からの抽出形式: "MM/DD HH:MM"
         for fmt in ("%y/%m/%d %H:%M", "%m/%d %H:%M", "%Y/%m/%d %H:%M", "%Y/%m/%d %H:%M:%S"):
             try:
                 dt = datetime.strptime(s, fmt)
                 if fmt == "%m/%d %H:%M":
+                    # 年がない場合は今年の年を補完する
                     dt = dt.replace(year=today_jst.year)
                 return dt.replace(tzinfo=TZ_JST)
             except ValueError:
                 pass
-            return None
+        return None
 
 def build_gspread_client() -> gspread.Client:
     """ GCP_SERVICE_ACCOUNT_KEY環境変数を使用して認証 """
@@ -252,10 +255,9 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
     soup = BeautifulSoup(driver.page_source, "html.parser")
     driver.quit()
     
-    # ★★★ 修正済み: 記事コンテナのセレクタを最新の構造に統一 ★★★
+    # 記事コンテナのセレクタを最新の構造に統一
     articles = soup.find_all("li", class_=re.compile("sc-1u4589e-0"))
-    # -----------------------------------------------------
-
+    
     articles_data = []
     
     for article in articles:
@@ -301,12 +303,13 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
                         if dt_obj:
                             formatted_date = format_datetime(dt_obj)
                     except:
-                        formatted_date = date_str
+                            formatted_date = date_str
 
                 articles_data.append({
                     "URL": url,
                     "タイトル": title,
-                    "投稿日時": formatted_date if formatted_date else "取得不可",
+                    # ★ 取得不可の場合は「取得不可」を入れておき、後で本文から補完する
+                    "投稿日時": formatted_date if formatted_date else "取得不可", 
                     "ソース": source_text
                 })
         except Exception as e:
@@ -315,11 +318,12 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
     print(f" Yahoo!ニュース件数: {len(articles_data)} 件取得")
     return articles_data
 
-def fetch_article_body_and_comments(base_url: str) -> Tuple[str, int]:
-    """ 記事本文とコメント数を取得する """
+def fetch_article_body_and_comments(base_url: str) -> Tuple[str, int, Optional[str]]:
+    """ 記事本文、コメント数、および記事本文から抽出した日時を返す """
     body_text = ""
     comment_count = 0
-    
+    extracted_date_str = None # ★ 新しく追加
+
     try:
         res = requests.get(base_url, headers=REQ_HEADERS, timeout=20)
         res.raise_for_status()
@@ -329,31 +333,41 @@ def fetch_article_body_and_comments(base_url: str) -> Tuple[str, int]:
         article = soup.find("article")
         if article:
             ps = article.find_all("p")
+            # 最初の数段落を結合して日時抽出に使う
+            body_text_partial = " ".join(p.get_text(strip=True) for p in ps[:3] if p.get_text(strip=True))
             body_text = "\n".join(p.get_text(strip=True) for p in ps if p.get_text(strip=True))
+            
+            # ★ 修正点1: 記事本文の冒頭から配信日時を抽出 ★
+            # 例: 10/15(水)19:10配信 または 10/15(水) 19:10配信
+            match = re.search(r'(\d{1,2}/\d{1,2})\([月火水木金土日]\)(\s*)(\d{1,2}:\d{2})配信', body_text_partial)
+            if match:
+                month_day = match.group(1)
+                time_str = match.group(3)
+                
+                # 'MM/DD HH:MM' の形式に変換
+                extracted_date_str = f"{month_day} {time_str}"
+            # ----------------------------------------------------
         
         # コメント数の取得
         comment_button = soup.find("button", attrs={"data-cl-params": re.compile(r"cmtmod")})
         
         if comment_button:
-            # riff-VisuallyHidden__root クラスを持つ隠し要素を探す（例: "コメント54件"）
             hidden_div = comment_button.find("div", class_="riff-VisuallyHidden__root")
             
             if hidden_div:
                 text = hidden_div.get_text(strip=True).replace(",", "")
             else:
-                # 隠し要素がない場合は、コメントボタン全体のテキストを試す
                 text = comment_button.get_text(strip=True).replace(",", "")
             
-            # テキストから数字(\d+)部分だけを抽出
             match = re.search(r'(\d+)', text)
             
             if match:
                 comment_count = int(match.group(1))
-        
+
     except Exception as e:
         print(f"    ! 詳細取得エラー: {e}")
         
-    return body_text, comment_count
+    return body_text, comment_count, extracted_date_str # ★ 戻り値に追加
 
 
 # ====== スプレッドシート操作関数 ======
@@ -391,12 +405,14 @@ def write_and_sort_news_list_to_source(gc: gspread.Client, articles: list[dict])
         
         now = jst_now()
         def sort_key(row):
+            # 投稿日時 (C列) でソート
             if len(row) > 2:
                 dt = parse_post_date(row[2], now)
+                # 日時が取得できない場合は一番古いものとして扱う
                 return dt if dt else datetime.max.replace(tzinfo=TZ_JST) 
             else:
                 return datetime.max.replace(tzinfo=TZ_JST)
-                
+            
         sorted_rows = sorted(rows, key=sort_key) 
         
         full_data_to_write = [header] + sorted_rows
@@ -411,7 +427,7 @@ def write_and_sort_news_list_to_source(gc: gspread.Client, articles: list[dict])
 
 
 def process_and_update_yahoo_sheet(gc: gspread.Client):
-    """ E～I列が未入力の行に対し、詳細取得とGemini分析を実行する """
+    """ C～I列が未入力の行に対し、詳細取得とGemini分析を実行する """
     
     sh = gc.open_by_key(SOURCE_SPREADSHEET_ID)
     ws = sh.worksheet(SOURCE_SHEET_NAME)
@@ -427,22 +443,26 @@ def process_and_update_yahoo_sheet(gc: gspread.Client):
     for idx, data_row in enumerate(data_rows):
         row_num = idx + 2 
         
-        url = data_row[0] if len(data_row) > 0 else "" 
+        # A-D列の値を取得
+        url = data_row[0] if len(data_row) > 0 else ""
+        title = data_row[1] if len(data_row) > 1 else "不明"
+        post_date_raw = data_row[2] if len(data_row) > 2 else "" # C列の元の投稿日時
+        source = data_row[3] if len(data_row) > 3 else ""         # D列の元のソース
         
-        # 現在のE-I列の値を取得
-        body = data_row[4] if len(data_row) > 4 else "" 
-        comment_count = data_row[5] if len(data_row) > 5 else "" 
+        # E-I列の値を取得
+        body = data_row[4] if len(data_row) > 4 else ""  
+        comment_count = data_row[5] if len(data_row) > 5 else ""  
         sentiment = data_row[6] if len(data_row) > 6 else ""
         category = data_row[7] if len(data_row) > 7 else ""
         relevance = data_row[8] if len(data_row) > 8 else ""
 
-        # フラグ: 本文とコメント数が必要か
-        needs_details = not body.strip() or not str(comment_count).strip()
+        # フラグ: 本文、コメント数、または日時が必要か (C, E, F列の更新が必要な場合)
+        needs_details = not body.strip() or not str(comment_count).strip() or "取得不可" in post_date_raw or not post_date_raw.strip()
         
-        # フラグ: Gemini分析が必要か
+        # フラグ: Gemini分析が必要か (G, H, I列の更新が必要な場合)
         needs_analysis = not str(sentiment).strip() or not str(category).strip() or not str(relevance).strip()
 
-        # スキップ条件: 本文が既に入っていて、かつ分析結果もすべて入っている場合のみ
+        # スキップ条件: すべてのデータが揃っている場合
         if not needs_details and not needs_analysis:
             continue
             
@@ -450,24 +470,34 @@ def process_and_update_yahoo_sheet(gc: gspread.Client):
             print(f"  - 行 {row_num}: URLがないためスキップ。")
             continue
 
-        title = data_row[1] if len(data_row) > 1 else "不明"
         print(f"  - 行 {row_num} (記事: {title[:20]}...): 処理を実行中...")
 
-        # 1. 本文とコメント数の取得 (E, F列)
+        # --- 詳細取得 (C, E, F列の補完) ---
         article_body = body
         final_comment_count = comment_count
-        
+        final_post_date = post_date_raw
+
         if needs_details or not article_body.strip(): # 本文が空か、詳細取得が必要な場合
-            fetched_body, fetched_comment_count = fetch_article_body_and_comments(url)
+            fetched_body, fetched_comment_count, extracted_date = fetch_article_body_and_comments(url) 
             
+            # 本文の補完
             if not article_body.strip():
                 article_body = fetched_body
             
+            # コメント数の補完
             if not str(final_comment_count).strip() or str(final_comment_count).strip() == '0':
                 final_comment_count = fetched_comment_count
+            
+            # ★ 投稿日時の補完 (C列) ★
+            if ("取得不可" in final_post_date or not final_post_date.strip()) and extracted_date:
+                dt_obj = parse_post_date(extracted_date, jst_now())
+                if dt_obj:
+                    final_post_date = format_datetime(dt_obj)
+                else:
+                    final_post_date = extracted_date # フォーマット失敗なら生データを入れておく
+
         
-        
-        # 2. Geminiで分析を実行 (G, H, I列)
+        # --- Gemini分析を実行 (G, H, I列) ---
         final_sentiment = sentiment
         final_category = category
         final_relevance = relevance
@@ -480,41 +510,43 @@ def process_and_update_yahoo_sheet(gc: gspread.Client):
              final_sentiment, final_category, final_relevance = "N/A(No Body)", "N/A", "0"
 
         
-        # 3. 更新データを作成
-        new_body = article_body if not body.strip() else body
-        new_comment_count = final_comment_count if not str(comment_count).strip() or str(comment_count).strip() == '0' else comment_count
+        # --- 最終的な更新データ ---
+        # 本文とコメント数 (E, F列)
+        new_body = article_body
+        new_comment_count = final_comment_count
 
-        if needs_analysis and article_body.strip():
-             new_sentiment = final_sentiment
-             new_category = final_category
-             new_relevance = final_relevance
-        elif needs_analysis and not article_body.strip():
-             new_sentiment = final_sentiment 
-             new_category = final_category 
-             new_relevance = final_relevance 
-        else: # 分析が必要ない場合は既存値を保持
-             new_sentiment = sentiment
-             new_category = category
-             new_relevance = relevance
+        # 分析結果 (G, H, I列)
+        new_sentiment = final_sentiment
+        new_category = final_category
+        new_relevance = final_relevance
 
-        # 最終的な更新データ
-        updates_dict[row_num] = [new_body, new_comment_count, new_sentiment, new_category, new_relevance]
+
+        # 最終的な更新データ (C列からI列まで)
+        updates_dict[row_num] = [
+            final_post_date, # C列 (投稿日時)
+            source,          # D列 (ソース) - 変更なし
+            new_body,        # E列 (本文)
+            new_comment_count, # F列 (コメント数)
+            new_sentiment,   # G列 (ポジネガ)
+            new_category,    # H列 (カテゴリ)
+            new_relevance    # I列 (関連度)
+        ]
 
 
     if updates_dict:
         updates_list = []
         rows_to_update = sorted(updates_dict.keys())
         
-        # E列からI列までを一括で更新
+        # C列からI列までを一括で更新
         for r_num in rows_to_update:
-            range_name = f'E{r_num}:I{r_num}' 
+            range_name = f'C{r_num}:I{r_num}' 
             updates_list.append({
                 'range': range_name,
                 'values': [updates_dict[r_num]] 
             })
             
         ws.batch_update(updates_list, value_input_option='USER_ENTERED')
-        print(f" Yahooシートの {len(updates_dict)} 行のE-I列を更新しました。")
+        print(f" Yahooシートの {len(updates_dict)} 行のC-I列を更新しました。")
     else:
         print(" Yahooシートで新たに取得・分析すべき空欄の行はありませんでした。")
 
@@ -530,15 +562,13 @@ def main():
         print(f"致命的エラー: {e}")
         return
     
-    # 1. Yahooシートに記事リストを追記し、投稿日の古い順に並び替え
+    # 1. Yahooシートに記事リストを追記し、投稿日の古い順に並び替え (A-D列を更新)
     yahoo_news_articles = get_yahoo_news_with_selenium(KEYWORD)
     write_and_sort_news_list_to_source(gc, yahoo_news_articles)
     
-    # 2. YahooシートのE-I列に対し、本文、コメント数、Gemini分析を実行し、空欄があれば更新。
+    # 2. YahooシートのE-I列に対し、本文、コメント数、日時補完、Gemini分析を実行し、空欄があれば更新。
     process_and_update_yahoo_sheet(gc)
     
-    # ★ 削除済み: 3. 当日シートを作成し、Yahooシートから対象期間の全記事（A-I列）をコピー。
-
     print("\n--- 統合スクリプト終了 ---")
 
 if __name__ == "__main__":
