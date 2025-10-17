@@ -3,8 +3,8 @@
 統合スクリプト（国内8社対応版） - 最終設定バージョン：
 1. keywords.txtから全メーカーを読み込み、順次Yahooシートに記事リストを追記 (A-D列)。
 2. 本文とコメント数を取得し、行ごとにスプレッドシートに即時反映 (E-F列)。
-3. 全記事を投稿日の古い順に並び替え (A-D列を基準にソート)。
-4. ソートされた記事に対し、古いものからGemini分析（G, H, I列）を実行。
+3. 全記事を投稿日の新しい順に並び替え (A-D列を基準にソート)。 <--- 変更
+4. ソートされた記事に対し、新しいものからGemini分析（G, H, I列）を実行。
    Gemini分析でクォータ制限エラーが出た場合は、そこで処理を中断する。
 """
 
@@ -36,7 +36,7 @@ from google.api_core.exceptions import ResourceExhausted
 # ------------------------------------
 
 # ====== 設定 (変更なし) ======
-SHARED_SPREADSHEET_ID = "1Ru2DT_zzKjTJptchWJitCb67VoffImGhgeOVjwlKukc"
+SHARED_SPREADSHEET_ID = "1Ru2DT_zzKjTJptchWJitCb67VoffImGhgeOVyKukc"
 KEYWORD_FILE = "keywords.txt" 
 SOURCE_SPREADSHEET_ID = SHARED_SPREADSHEET_ID
 SOURCE_SHEET_NAME = "Yahoo"
@@ -408,7 +408,7 @@ def fetch_article_body_and_comments(base_url: str) -> Tuple[str, int, Optional[s
     return body_text, comment_count, extracted_date_str
 
 
-# ====== スプレッドシート操作関数 (変更なし) ======
+# ====== スプレッドシート操作関数 (sort_yahoo_sheet 関数のみ変更) ======
 
 def set_row_height(ws: gspread.Worksheet, row_height_pixels: int):
     try:
@@ -478,18 +478,20 @@ def sort_yahoo_sheet(gc: gspread.Client):
     def sort_key(row):
         if len(row) > 2:
             dt = parse_post_date(str(row[2]), now)
-            return dt if dt else datetime.max.replace(tzinfo=TZ_JST) 
+            # ★ 日付に変換できない場合は、新しい順のソートでリストの末尾に来るように datetime.min を返す
+            return dt if dt else datetime.min.replace(tzinfo=TZ_JST) 
         else:
-            return datetime.max.replace(tzinfo=TZ_JST)
+            return datetime.min.replace(tzinfo=TZ_JST)
         
-    sorted_rows = sorted(rows, key=sort_key) 
+    # ★ reverse=True に変更し、新しい順にソートする
+    sorted_rows = sorted(rows, key=sort_key, reverse=True) 
     
     full_data_to_write = [header] + sorted_rows
     range_end = gspread.utils.rowcol_to_a1(len(full_data_to_write), len(YAHOO_SHEET_HEADERS))
     
     worksheet.update(values=full_data_to_write, range_name=f'A1:{range_end}', value_input_option='USER_ENTERED')
     
-    print(" SOURCEシートを投稿日時の古い順に並び替えました。")
+    print(" SOURCEシートを投稿日時の**新しい順**に並び替えました。")
 
 
 # ====== 本文・コメント数の取得と即時更新 (E, F列) (ロジックは変更なし) ======
