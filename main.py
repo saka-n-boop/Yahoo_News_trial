@@ -35,7 +35,6 @@ from google.api_core.exceptions import ResourceExhausted
 # ------------------------------------
 
 # ====== 設定 ======
-# ★指定されたスプレッドシートIDを使用
 SHARED_SPREADSHEET_ID = "1Ru2DT_zzKjTJptchWJitCb67VoffImGhgeOVjwlKukc"
 KEYWORD_FILE = "keywords.txt" 
 SOURCE_SPREADSHEET_ID = SHARED_SPREADSHEET_ID
@@ -166,7 +165,7 @@ def load_gemini_prompt() -> str:
         print(f"致命的エラー: プロンプトファイルの読み込み中にエラーが発生しました: {e}")
         return ""
 
-# ====== Gemini 分析関数 (修正済み) ======
+# ====== Gemini 分析関数 (クォータエラー即中断) ======
 def analyze_with_gemini(text_to_analyze: str) -> Tuple[str, str, str, bool]: 
     # 戻り値は (company_info, category, sentiment, is_quota_error) の4つ
     if not GEMINI_CLIENT:
@@ -209,19 +208,20 @@ def analyze_with_gemini(text_to_analyze: str) -> Tuple[str, str, str, bool]:
             # 成功時: is_quota_error = False を含めて返す
             return company_info, category, sentiment, False
 
-        # ★ 修正ポイント1: クォータ制限エラーを直接捕捉し、即座に中断フラグを返す
+        # ★ クォータ制限エラーを最優先で捕捉し、リトライなしで中断
         except ResourceExhausted as e:
             print(f"  🚨 Gemini API クォータ制限エラー (429): {e}")
             return "ERROR(Quota)", "ERROR", "ERROR", True 
 
-        # ★ 修正ポイント2: その他のエラー (一時的なエラー) のみリトライする
+        # ★ クォータ以外の一般的なエラーのみリトライ対象とする
         except Exception as e:
             if attempt < MAX_RETRIES - 1:
                 wait_time = 2 ** attempt + random.random()
-                print(f"  ⚠️ Gemini API 一時的なエラー。{wait_time:.2f} 秒待機してリトライします (試行 {attempt + 1}/{MAX_RETRIES})。")
+                print(f"  ⚠️ Gemini API 一時的な接続または処理エラー。{wait_time:.2f} 秒待機してリトライします (試行 {attempt + 1}/{MAX_RETRIES})。")
                 time.sleep(wait_time)
                 continue
             else:
+                # 最終的に失敗した場合
                 print(f"Gemini分析エラー: {e}")
                 return "ERROR", "ERROR", "ERROR", False 
     
@@ -393,30 +393,14 @@ def fetch_article_body_and_comments(base_url: str) -> Tuple[str, int, Optional[s
     return body_text, comment_count, extracted_date_str
 
 
-# ====== スプレッドシート操作関数 ======
+# ====== スプレッドシート操作関数 (修正済み) ======
 
-def set_row_height_and_column_widths(ws: gspread.Worksheet, col_width_pixels: int, row_height_pixels: int):
-    """ シートの全行の高さを固定し、全列の幅を指定されたピクセル値に設定する """
+def set_row_height(ws: gspread.Worksheet, row_height_pixels: int):
+    """ シートの全行の高さを指定されたピクセル値に設定する (列幅調整は行わない) """
     try:
         requests = []
         
-        # 1. 列幅の設定 (A列からI列まで)
-        requests.append({
-            "updateDimensionProperties": {
-                "range": {
-                    "sheetId": ws.id,
-                    "dimension": "COLUMNS",
-                    "startIndex": 0, 
-                    "endIndex": len(YAHOO_SHEET_HEADERS)
-                },
-                "properties": {
-                    "pixelSize": col_width_pixels
-                },
-                "fields": "pixelSize"
-            }
-        })
-        
-        # 2. 行の高さの設定 (2行目からシートの最終行まで)
+        # 1. 行の高さの設定 (2行目からシートの最終行まで)
         requests.append({
             "updateDimensionProperties": {
                 "range": {
@@ -433,10 +417,9 @@ def set_row_height_and_column_widths(ws: gspread.Worksheet, col_width_pixels: in
         })
 
         ws.spreadsheet.batch_update({"requests": requests})
-        print(f" シートの全列 (A-{gspread.utils.rowcol_to_a1(1, len(YAHOO_SHEET_HEADERS))[0]}列) の幅を {col_width_pixels} ピクセルに設定し、")
         print(f" 2行目以降の**行の高さ**を {row_height_pixels} ピクセルに設定しました。")
     except Exception as e:
-        print(f" ⚠️ 列幅・行高設定エラー: {e}")
+        print(f" ⚠️ 行高設定エラー: {e}")
 
 
 def ensure_source_sheet_headers(sh: gspread.Spreadsheet) -> gspread.Worksheet:
@@ -634,10 +617,10 @@ def process_and_update_yahoo_sheet(gc: gspread.Client) -> bool: # 戻り値は�
         print(" Yahooシートで新たに取得・分析すべき空欄の行はありませんでした。")
     
     # -------------------------------------------------------------
-    # 3. 列幅と行の高さの調整
+    # 3. 行の高さの調整 (★ 修正済み)
     # -------------------------------------------------------------
-    # 列幅は20ピクセル、行の高さはデフォルトの21ピクセルに設定
-    set_row_height_and_column_widths(ws, col_width_pixels=20, row_height_pixels=21) 
+    # 行の高さはデフォルトの21ピクセルに設定
+    set_row_height(ws, row_height_pixels=21) 
 
     return False # 正常終了フラグとしてFalseを返す
 
