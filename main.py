@@ -5,6 +5,7 @@
 2. 投稿日時から曜日を確実に削除し、クリーンな形式で格納。
 3. 本文とコメント数を取得し、行ごとにスプレッドシートに即時反映 (E-F列)。
 4. 全記事を投稿日の新しい順に並び替え (A-D列を基準にソート)。
+   -> ソート直前にスプレッドシート上でC列の曜日を正規表現置換で削除。
 5. ソートされた記事に対し、新しいものからGemini分析（G, H, I列）を実行。
    Gemini分析でクォータ制限エラーが出た場合は、そこで処理を中断する。
 """
@@ -37,7 +38,7 @@ from google.api_core.exceptions import ResourceExhausted
 # ------------------------------------
 
 # ====== 設定 (変更なし) ======
-SHARED_SPREADSHEET_ID = "1Ru2DT_zzKjTJptchWJitCb67VoffImGhgeOVjwlKukc"
+SHARED_SPREADSHEET_ID = "1Ru2DT_zzKjTJptchWJitCb67VoffImGhgeOVyKukc"
 KEYWORD_FILE = "keywords.txt" 
 SOURCE_SPREADSHEET_ID = SHARED_SPREADSHEET_ID
 SOURCE_SHEET_NAME = "Yahoo"
@@ -55,7 +56,6 @@ PROMPT_FILES = [
 ]
 
 try:
-    # 環境変数にキーがない場合はここで例外が発生するが、ここではクライアントオブジェクトの存在のみをチェック
     GEMINI_CLIENT = genai.Client()
 except Exception as e:
     print(f"警告: Geminiクライアントの初期化に失敗しました。Gemini分析はスキップされます。エラー: {e}")
@@ -77,7 +77,7 @@ def parse_post_date(raw, today_jst: datetime) -> Optional[datetime]:
     if isinstance(raw, str):
         s = raw.strip()
         
-        # ★ 修正: 曜日のパターンを削除する正規表現を確実に実行
+        # 曜日のパターンを削除する正規表現を確実に実行
         s = re.sub(r"\([月火水木金土日]\)$", "", s).strip()
         
         for fmt in ("%y/%m/%d %H:%M", "%m/%d %H:%M", "%Y/%m/%d %H:%M", "%Y/%m/%d %H:%M:%S"):
@@ -204,7 +204,7 @@ def analyze_with_gemini(text_to_analyze: str) -> Tuple[str, str, str, bool]:
 
             return company_info, category, sentiment, False
 
-        # ★ クォータ制限エラーを最優先で捕捉し、強制終了
+        # クォータ制限エラーを最優先で捕捉し、強制終了
         except ResourceExhausted as e:
             print(f"  🚨 Gemini API クォータ制限エラー (429): {e}")
             print("\n===== 🛑 クォータ制限を検出したため、システムを直ちに中断します。 =====")
@@ -232,11 +232,11 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
     options.add_argument("--headless=new") 
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
-    options.add_argument("--window-size=1920,1080") # ★ ウィンドウサイズを大きくして安定化
+    options.add_argument("--window-size=1920,1080") 
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument(f"user-agent={REQ_HEADERS['User-Agent']}")
     
-    # ★ 追加：スクレイピング対策回避と安定化のためのオプション
+    # スクレイピング対策回避と安定化のためのオプション
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option('useAutomationExtension', False)
@@ -253,11 +253,11 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
     driver.get(search_url)
     
     try:
-        # ★ タイムアウトを20秒に延長し、ECを visibility_of_element_located に変更
+        # タイムアウトを20秒に延長し、ECを visibility_of_element_located に変更
         WebDriverWait(driver, 20).until(
             EC.visibility_of_element_located((By.CSS_SELECTOR, "li[class*='sc-1u4589e-0']"))
         )
-        time.sleep(3) # ★ ロード後の追加待機を3秒に
+        time.sleep(3) # ロード後の追加待機を3秒に
     except Exception as e:
         print(f"  ⚠️ ページロードまたは要素検索でタイムアウト。全キーワード0件の場合、この警告が原因の可能性が高いです。エラー: {e}")
         time.sleep(5) 
@@ -284,7 +284,7 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
             if time_tag:
                 date_str = time_tag.text.strip()
             
-            # --- ソース (D列) 抽出ロジック (省略) ---
+            # --- ソース (D列) 抽出ロジック ---
             source_text = ""
             source_container = article.find("div", class_=re.compile("sc-n3vj8g-0"))
             
@@ -315,7 +315,7 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
                 formatted_date = ""
                 if date_str:
                     try:
-                        # ★ 修正: parse_post_date を呼び出し、曜日を除去したクリーンな日時オブジェクトを取得
+                        # parse_post_date を呼び出し、曜日を除去したクリーンな日時オブジェクトを取得
                         dt_obj = parse_post_date(date_str, today_jst)
                         
                         if dt_obj:
@@ -408,7 +408,7 @@ def fetch_article_body_and_comments(base_url: str) -> Tuple[str, int, Optional[s
     return body_text, comment_count, extracted_date_str
 
 
-# ====== スプレッドシート操作関数 (sort_yahoo_sheet は新しい順ソート) ======
+# ====== スプレッドシート操作関数 (sort_yahoo_sheet 関数を修正) ======
 
 def set_row_height(ws: gspread.Worksheet, row_height_pixels: int):
     try:
@@ -466,6 +466,40 @@ def sort_yahoo_sheet(gc: gspread.Client):
     except gspread.exceptions.WorksheetNotFound:
         print("ソートスキップ: Yahooシートが見つかりません。")
         return
+
+    # --- 修正: ソート前にシート上で曜日を削除する ---
+    try:
+        requests = []
+        
+        # 1. C列の全セルに対して、曜日パターン (例: (水)) を削除する正規表現置換リクエスト
+        requests.append({
+            "findReplace": {
+                "sheetId": worksheet.id,
+                "range": "C2:C", # 2行目からC列全体
+                "find": r"\([月火水木金土日]\)", # 曜日を含む正規表現パターン
+                "replacement": "", 
+                "allSheets": False,
+                "regex": True
+            }
+        })
+        # 2. 曜日の直後に残る可能性のあるスペースを削除する
+        requests.append({
+            "findReplace": {
+                "sheetId": worksheet.id,
+                "range": "C2:C",
+                "find": r"\s{2,}", # 2つ以上の連続したスペースを検索
+                "replacement": " ", # 1つのスペースに置換
+                "allSheets": False,
+                "regex": True
+            }
+        })
+        
+        worksheet.spreadsheet.batch_update({"requests": requests})
+        print(" スプレッドシート上でC列の**曜日記載を削除**しました。")
+    except Exception as e:
+        print(f" ⚠️ スプレッドシート上の置換エラー: {e}")
+    # ----------------------------------------------------
+
 
     all_values = worksheet.get_all_values(value_render_option='UNFORMATTED_VALUE')
     if len(all_values) <= 1:
