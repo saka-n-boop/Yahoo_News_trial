@@ -218,7 +218,7 @@ def analyze_with_gemini(text_to_analyze: str) -> Tuple[str, str, str, bool]:
     
     return "ERROR", "ERROR", "ERROR", False
 
-# ====== データ取得関数 (日時・ソース抽出ロジックを修正) ======
+# ====== データ取得関数 (Selenium安定化と日時・ソース抽出ロジックを修正) ======
 
 def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
     print(f"  Yahoo!ニュース検索開始 (キーワード: {keyword})...")
@@ -226,9 +226,14 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
     options.add_argument("--headless=new") 
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
-    options.add_argument("--window-size=1280,1024")
+    options.add_argument("--window-size=1920,1080") # ★ ウィンドウサイズを大きくして安定化
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument(f"user-agent={REQ_HEADERS['User-Agent']}")
+    
+    # ★ 追加：スクレイピング対策回避と安定化のためのオプション
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option('useAutomationExtension', False)
     
     try:
         driver_path = ChromeDriverManager().install()
@@ -242,11 +247,13 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
     driver.get(search_url)
     
     try:
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "li[class*='sc-1u4589e-0']"))
+        # ★ タイムアウトを20秒に延長し、ECを visibility_of_element_located に変更
+        WebDriverWait(driver, 20).until(
+            EC.visibility_of_element_located((By.CSS_SELECTOR, "li[class*='sc-1u4589e-0']"))
         )
-        time.sleep(1) 
-    except Exception:
+        time.sleep(3) # ★ ロード後の追加待機を3秒に
+    except Exception as e:
+        print(f"  ⚠️ ページロードまたは要素検索でタイムアウト。全キーワード0件の場合、この警告が原因の可能性が高いです。エラー: {e}")
         time.sleep(5) 
     
     soup = BeautifulSoup(driver.page_source, "html.parser")
@@ -266,7 +273,6 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
             
             # --- 投稿日時 (C列) 抽出ロジック再強化 ---
             date_str = ""
-            # 優先度1: <time>タグから取得 (最も正確)
             time_tag = article.find("time")
             if time_tag:
                 date_str = time_tag.text.strip()
@@ -276,44 +282,38 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
             source_container = article.find("div", class_=re.compile("sc-n3vj8g-0"))
             
             if source_container:
-                # ソースと日時・コメントが含まれる inner div
                 inner_div = source_container.find("div", class_=re.compile("sc-110wjhy-8"))
 
                 if inner_div:
-                    # 最初のSPAMタグ（コメント数）を探す
+                    # コメント数SPANを見つける (sc-jksony-0)
                     comment_span = inner_div.find("span", class_=re.compile("sc-jksony-0"))
                     
-                    # 投稿日時 (time) とカテゴリ (span) を除く最初のテキストノードまたはspanがソース
-                    
-                    # 子要素のリストを作成
-                    children = [c for c in inner_div.contents if c.strip() or c.name]
-                    
-                    # コメント数SPAMの直後（またはinner_divの最初）のテキストノードまたはSPANを探す
                     source_candidate = None
                     if comment_span:
-                        # コメント数の次の要素を検索
+                        # コメント数の次の要素を検索 (通常はソースのテキストノードまたはSPAN)
                         next_element = comment_span.find_next_sibling()
-                        if next_element and next_element.name == 'span' and not next_element.has_attr('class') or next_element.get('class') == ['sc-110wjhy-9','cnuhon']:
-                            # コメント数の次のspanタグをソースとする（例: ①②③のロイター、MotorFan、carview！）
+                        
+                        # next_elementがSPANで、かつカテゴリ (sc-110wjhy-1) でなければソース
+                        if next_element and next_element.name == 'span' and not next_element.get('class', [''])[0].startswith('sc-110wjhy-1'):
                             source_candidate = next_element.text.strip()
-                        elif next_element and next_element.name == 'span' and next_element.get('class') == ['sc-110wjhy-1', 'hgCcVT']:
-                             # コメントの次にカテゴリがあった場合、その次も確認 (稀だが一応)
-                             source_candidate = comment_span.next_sibling.strip() if comment_span.next_sibling and comment_span.next_sibling.strip() else ""
-                        else:
-                            # コメント数の後のテキストノードを取得 (稀)
-                            source_candidate = comment_span.next_sibling.strip() if comment_span.next_sibling and comment_span.next_sibling.strip() else ""
-
+                        
+                        # コメント数SPANの直後のテキストノードを取得 (もしあれば)
+                        elif comment_span.next_sibling and comment_span.next_sibling.strip():
+                            source_candidate = comment_span.next_sibling.strip()
+                    
+                    # コメント数がない場合、最初のSPANがソースか確認 (稀)
                     else:
-                        # コメント数がない場合、最初のspanをソースとする (この構造は稀)
                         first_span = inner_div.find("span")
+                        # SVGタグを含むコメントSPANではないことを確認
                         if first_span and not first_span.find("svg"):
                              source_candidate = first_span.text.strip()
-
-                    # 最終的なソースの決定
+                    
                     if source_candidate:
-                        source_text = source_candidate
+                        # ソース候補が日付や時刻のパターンでないことを確認
+                        if not re.match(r'\d{1,2}/\d{1,2}\([月火水木金土日]\)\d{1,2}:\d{2}', source_candidate) and len(source_candidate) > 0:
+                            source_text = source_candidate
 
-            # 投稿日時とソースが取得できた場合のみ処理を続行
+            
             if title and url:
                 formatted_date = ""
                 if date_str:
@@ -331,9 +331,8 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
                 articles_data.append({
                     "URL": url,
                     "タイトル": title,
-                    # 投稿日時が空の場合は「取得不可」をセット
                     "投稿日時": formatted_date if formatted_date else "取得不可", 
-                    "ソース": source_text if source_text else "取得不可" # ソースが空の場合は「取得不可」をセット
+                    "ソース": source_text if source_text else "取得不可"
                 })
         except Exception as e:
             # 個別記事のパースエラーはスキップ
