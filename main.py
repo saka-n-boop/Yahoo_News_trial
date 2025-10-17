@@ -43,7 +43,6 @@ SOURCE_SHEET_NAME = "Yahoo"
 DEST_SPREADSHEET_ID = SHARED_SPREADSHEET_ID
 
 # ★★★ ヘッダー構成 ★★★
-# G列: 対象企業, H列: カテゴリ, I列: ポジネガ分類
 YAHOO_SHEET_HEADERS = ["URL", "タイトル", "投稿日時", "ソース", "本文", "コメント数", "対象企業", "カテゴリ分類", "ポジネガ分類"] 
 REQ_HEADERS = {"User-Agent": "Mozilla/5.0"}
 TZ_JST = timezone(timedelta(hours=9))
@@ -167,7 +166,7 @@ def load_gemini_prompt() -> str:
         print(f"致命的エラー: プロンプトファイルの読み込み中にエラーが発生しました: {e}")
         return ""
 
-# ====== Gemini 分析関数 ======
+# ====== Gemini 分析関数 (修正済み) ======
 def analyze_with_gemini(text_to_analyze: str) -> Tuple[str, str, str, bool]: 
     # 戻り値は (company_info, category, sentiment, is_quota_error) の4つ
     if not GEMINI_CLIENT:
@@ -203,18 +202,19 @@ def analyze_with_gemini(text_to_analyze: str) -> Tuple[str, str, str, bool]:
 
             analysis = json.loads(response.text.strip())
             
-            company_info = analysis.get("company_info", "N/A") # G列
-            category = analysis.get("category", "N/A")         # H列
-            sentiment = analysis.get("sentiment", "N/A")       # I列
+            company_info = analysis.get("company_info", "N/A") 
+            category = analysis.get("category", "N/A")         
+            sentiment = analysis.get("sentiment", "N/A")       
 
             # 成功時: is_quota_error = False を含めて返す
             return company_info, category, sentiment, False
 
+        # ★ 修正ポイント1: クォータ制限エラーを直接捕捉し、即座に中断フラグを返す
         except ResourceExhausted as e:
             print(f"  🚨 Gemini API クォータ制限エラー (429): {e}")
-            # クォータ制限エラー時: is_quota_error = True を含めて返す
             return "ERROR(Quota)", "ERROR", "ERROR", True 
 
+        # ★ 修正ポイント2: その他のエラー (一時的なエラー) のみリトライする
         except Exception as e:
             if attempt < MAX_RETRIES - 1:
                 wait_time = 2 ** attempt + random.random()
@@ -416,7 +416,7 @@ def set_row_height_and_column_widths(ws: gspread.Worksheet, col_width_pixels: in
             }
         })
         
-        # 2. 行の高さの設定 (1行目からシートの最終行まで)
+        # 2. 行の高さの設定 (2行目からシートの最終行まで)
         requests.append({
             "updateDimensionProperties": {
                 "range": {
