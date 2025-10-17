@@ -2,9 +2,10 @@
 """
 統合スクリプト（国内8社対応版） - 最終設定バージョン：
 1. keywords.txtから全メーカーを読み込み、順次Yahooシートに記事リストを追記 (A-D列)。
-2. 本文とコメント数を取得し、行ごとにスプレッドシートに即時反映 (E-F列)。
-3. 全記事を投稿日の新しい順に並び替え (A-D列を基準にソート)。 <--- 変更
-4. ソートされた記事に対し、新しいものからGemini分析（G, H, I列）を実行。
+2. 投稿日時から曜日を確実に削除し、クリーンな形式で格納。
+3. 本文とコメント数を取得し、行ごとにスプレッドシートに即時反映 (E-F列)。
+4. 全記事を投稿日の新しい順に並び替え (A-D列を基準にソート)。
+5. ソートされた記事に対し、新しいものからGemini分析（G, H, I列）を実行。
    Gemini分析でクォータ制限エラーが出た場合は、そこで処理を中断する。
 """
 
@@ -54,6 +55,7 @@ PROMPT_FILES = [
 ]
 
 try:
+    # 環境変数にキーがない場合はここで例外が発生するが、ここではクライアントオブジェクトの存在のみをチェック
     GEMINI_CLIENT = genai.Client()
 except Exception as e:
     print(f"警告: Geminiクライアントの初期化に失敗しました。Gemini分析はスキップされます。エラー: {e}")
@@ -61,24 +63,28 @@ except Exception as e:
 
 GEMINI_PROMPT_TEMPLATE = None
 
-# ====== ヘルパー関数群 (変更なし) ======
+# ====== ヘルパー関数群 (parse_post_date 関数を修正) ======
 
 def jst_now() -> datetime:
     return datetime.now(TZ_JST)
 
 def format_datetime(dt_obj) -> str:
+    # スプレッドシートの表示形式に合わせる
     return dt_obj.strftime("%y/%m/%d %H:%M")
 
 def parse_post_date(raw, today_jst: datetime) -> Optional[datetime]:
     if raw is None: return None
     if isinstance(raw, str):
         s = raw.strip()
+        
+        # ★ 修正: 曜日のパターンを削除する正規表現を確実に実行
         s = re.sub(r"\([月火水木金土日]\)$", "", s).strip()
-        s = s.strip()
+        
         for fmt in ("%y/%m/%d %H:%M", "%m/%d %H:%M", "%Y/%m/%d %H:%M", "%Y/%m/%d %H:%M:%S"):
             try:
                 dt = datetime.strptime(s, fmt)
                 if fmt == "%m/%d %H:%M":
+                    # 年がない形式の場合、今年を適用
                     dt = dt.replace(year=today_jst.year)
                 return dt.replace(tzinfo=TZ_JST)
             except ValueError:
@@ -218,7 +224,7 @@ def analyze_with_gemini(text_to_analyze: str) -> Tuple[str, str, str, bool]:
     
     return "ERROR", "ERROR", "ERROR", False
 
-# ====== データ取得関数 (Selenium安定化と日時・ソース抽出ロジックを修正) ======
+# ====== データ取得関数 (get_yahoo_news_with_selenium 関数を修正) ======
 
 def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
     print(f"  Yahoo!ニュース検索開始 (キーワード: {keyword})...")
@@ -262,6 +268,7 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
     articles = soup.find_all("li", class_=re.compile("sc-1u4589e-0"))
     
     articles_data = []
+    today_jst = jst_now()
     
     for article in articles:
         try:
@@ -271,13 +278,13 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
             link_tag = article.find("a", href=True)
             url = link_tag["href"] if link_tag and link_tag["href"].startswith("https://news.yahoo.co.jp/articles/") else ""
             
-            # --- 投稿日時 (C列) 抽出ロジック再強化 ---
+            # --- 投稿日時 (C列) 抽出ロジック ---
             date_str = ""
             time_tag = article.find("time")
             if time_tag:
                 date_str = time_tag.text.strip()
             
-            # --- ソース (D列) 抽出ロジック再強化 ---
+            # --- ソース (D列) 抽出ロジック (省略) ---
             source_text = ""
             source_container = article.find("div", class_=re.compile("sc-n3vj8g-0"))
             
@@ -285,26 +292,16 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
                 inner_div = source_container.find("div", class_=re.compile("sc-110wjhy-8"))
 
                 if inner_div:
-                    # コメント数SPANを見つける (sc-jksony-0)
                     comment_span = inner_div.find("span", class_=re.compile("sc-jksony-0"))
-                    
                     source_candidate = None
                     if comment_span:
-                        # コメント数の次の要素を検索 (通常はソースのテキストノードまたはSPAN)
                         next_element = comment_span.find_next_sibling()
-                        
-                        # next_elementがSPANで、かつカテゴリ (sc-110wjhy-1) でなければソース
                         if next_element and next_element.name == 'span' and not next_element.get('class', [''])[0].startswith('sc-110wjhy-1'):
                             source_candidate = next_element.text.strip()
-                        
-                        # コメント数SPANの直後のテキストノードを取得 (もしあれば)
                         elif comment_span.next_sibling and comment_span.next_sibling.strip():
                             source_candidate = comment_span.next_sibling.strip()
-                    
-                    # コメント数がない場合、最初のSPANがソースか確認 (稀)
                     else:
                         first_span = inner_div.find("span")
-                        # SVGタグを含むコメントSPANではないことを確認
                         if first_span and not first_span.find("svg"):
                              source_candidate = first_span.text.strip()
                     
@@ -318,13 +315,14 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
                 formatted_date = ""
                 if date_str:
                     try:
-                        date_str_clean = re.sub(r"\([月火水木金土日]\)$", "", date_str).strip()
-                        dt_obj = parse_post_date(date_str_clean, jst_now())
+                        # ★ 修正: parse_post_date を呼び出し、曜日を除去したクリーンな日時オブジェクトを取得
+                        dt_obj = parse_post_date(date_str, today_jst)
                         
                         if dt_obj:
                             formatted_date = format_datetime(dt_obj)
                         else:
-                             formatted_date = date_str 
+                             # パース失敗時は生の文字列から曜日だけ削除して保持 (ソートのため)
+                             formatted_date = re.sub(r"\([月火水木金土日]\)$", "", date_str).strip()
                     except:
                         formatted_date = date_str
 
@@ -369,11 +367,13 @@ def fetch_article_body_and_comments(base_url: str) -> Tuple[str, int, Optional[s
                     full_body_parts.append(body_part)
                     
                     if page_num == 1:
+                        # 本文から日付を抽出するロジックはそのまま
                         body_text_partial = " ".join(p.get_text(strip=True) for p in ps[:3] if p.get_text(strip=True))
                         match = re.search(r'(\d{1,2}/\d{1,2})\([月火水木金土日]\)(\s*)(\d{1,2}:\d{2})配信', body_text_partial)
                         if match:
                             month_day = match.group(1)
                             time_str = match.group(3)
+                            # 抽出した文字列は 'MM/DD HH:MM' の形式にする
                             extracted_date_str = f"{month_day} {time_str}"
             
             if page_num == 1:
@@ -408,7 +408,7 @@ def fetch_article_body_and_comments(base_url: str) -> Tuple[str, int, Optional[s
     return body_text, comment_count, extracted_date_str
 
 
-# ====== スプレッドシート操作関数 (sort_yahoo_sheet 関数のみ変更) ======
+# ====== スプレッドシート操作関数 (sort_yahoo_sheet は新しい順ソート) ======
 
 def set_row_height(ws: gspread.Worksheet, row_height_pixels: int):
     try:
@@ -478,12 +478,12 @@ def sort_yahoo_sheet(gc: gspread.Client):
     def sort_key(row):
         if len(row) > 2:
             dt = parse_post_date(str(row[2]), now)
-            # ★ 日付に変換できない場合は、新しい順のソートでリストの末尾に来るように datetime.min を返す
+            # 日付に変換できない場合は、新しい順のソートでリストの末尾に来るように datetime.min を返す
             return dt if dt else datetime.min.replace(tzinfo=TZ_JST) 
         else:
             return datetime.min.replace(tzinfo=TZ_JST)
         
-    # ★ reverse=True に変更し、新しい順にソートする
+    # reverse=True に設定し、新しい順にソートする
     sorted_rows = sorted(rows, key=sort_key, reverse=True) 
     
     full_data_to_write = [header] + sorted_rows
@@ -549,7 +549,8 @@ def fetch_details_and_update_sheet(gc: gspread.Client):
             if dt_obj:
                 new_post_date = format_datetime(dt_obj)
             else:
-                new_post_date = extracted_date # 生の文字列を保持
+                # パース失敗時は生の文字列から曜日だけ削除して保持 (ソートのため)
+                new_post_date = re.sub(r"\([月火水木金土日]\)$", "", extracted_date).strip()
 
         
         # C, D, E, F列を即時更新
@@ -658,7 +659,7 @@ def main():
     # ② ステップ② 記事詳細（本文/コメント数）を取得し、行ごとに即時更新 (E, F列)
     fetch_details_and_update_sheet(gc)
     
-    # ③ ステップ③ 全ての記事が追記された後、ソートを実行
+    # ③ ステップ③ 全ての記事が追記された後、ソートを実行 (新しい順)
     print("\n===== 🔧 ステップ③ 全件ソート実行 =====")
     sort_yahoo_sheet(gc)
     
