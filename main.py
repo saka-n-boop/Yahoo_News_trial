@@ -37,12 +37,14 @@ from google.genai import types
 from google.api_core.exceptions import ResourceExhausted 
 # ------------------------------------
 
-# ====== 設定 (新しいIDに更新) ======
+# ====== 設定 (新しいIDに更新 & 最大行数を固定) ======
 SHARED_SPREADSHEET_ID = "1Ru2DT_zzKjTJptchWJitCb67VoffImGhgeOVjwlKukc" # 🚨 IDを更新
 KEYWORD_FILE = "keywords.txt" 
 SOURCE_SPREADSHEET_ID = SHARED_SPREADSHEET_ID
 SOURCE_SHEET_NAME = "Yahoo"
 DEST_SPREADSHEET_ID = SHARED_SPREADSHEET_ID
+# 曜日削除の対象とする最大行数を10000に設定
+MAX_SHEET_ROWS_FOR_REPLACE = 10000 
 
 YAHOO_SHEET_HEADERS = ["URL", "タイトル", "投稿日時", "ソース", "本文", "コメント数", "対象企業", "カテゴリ分類", "ポジネガ分類"] 
 REQ_HEADERS = {"User-Agent": "Mozilla/5.0"}
@@ -63,7 +65,7 @@ except Exception as e:
 
 GEMINI_PROMPT_TEMPLATE = None
 
-# ====== ヘルパー関数群 (parse_post_date 関数を修正) ======
+# ====== ヘルパー関数群 (変更なし) ======
 
 def jst_now() -> datetime:
     return datetime.now(TZ_JST)
@@ -163,7 +165,7 @@ def load_gemini_prompt() -> str:
         print(f"致命的エラー: プロンプトファイルの読み込み中にエラーが発生しました: {e}")
         return ""
 
-# ====== Gemini 分析関数 (クォータエラー発生時に強制停止) ======
+# ====== Gemini 分析関数 (変更なし) ======
 def analyze_with_gemini(text_to_analyze: str) -> Tuple[str, str, str, bool]: 
     if not GEMINI_CLIENT:
         return "N/A", "N/A", "N/A", False 
@@ -224,7 +226,7 @@ def analyze_with_gemini(text_to_analyze: str) -> Tuple[str, str, str, bool]:
     
     return "ERROR", "ERROR", "ERROR", False
 
-# ====== データ取得関数 (get_yahoo_news_with_selenium 関数を修正) ======
+# ====== データ取得関数 (変更なし) ======
 
 def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
     print(f"  Yahoo!ニュース検索開始 (キーワード: {keyword})...")
@@ -435,9 +437,11 @@ def set_row_height(ws: gspread.Worksheet, row_height_pixels: int):
 
 def ensure_source_sheet_headers(sh: gspread.Spreadsheet) -> gspread.Worksheet:
     try:
+        # シートが存在すれば取得
         ws = sh.worksheet(SOURCE_SHEET_NAME)
     except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title=SOURCE_SHEET_NAME, rows="3000", cols=str(len(YAHOO_SHEET_HEADERS)))
+        # シートがなければ作成（最大行数も10000行を想定）
+        ws = sh.add_worksheet(title=SOURCE_SHEET_NAME, rows=str(MAX_SHEET_ROWS_FOR_REPLACE), cols=str(len(YAHOO_SHEET_HEADERS)))
         
     current_headers = ws.row_values(1)
     if current_headers != YAHOO_SHEET_HEADERS:
@@ -454,6 +458,7 @@ def write_news_list_to_source(gc: gspread.Client, articles: list[dict]):
     new_data = [[a['URL'], a['タイトル'], a['投稿日時'], a['ソース']] for a in articles if a['URL'] not in existing_urls]
     
     if new_data:
+        # 新しいデータを最終行に追記
         worksheet.append_rows(new_data, value_input_option='USER_ENTERED')
         print(f"  SOURCEシートに {len(new_data)} 件追記しました。")
     else:
@@ -467,32 +472,35 @@ def sort_yahoo_sheet(gc: gspread.Client):
         print("ソートスキップ: Yahooシートが見つかりません。")
         return
 
-    # --- 修正: ソート前にシート上で曜日を削除する (sheetIdを削除してスコープ競合を解消) ---
+    # 🚨 修正点: 曜日削除の対象範囲を C2:C10000 に固定
+    target_range = f"C2:C{MAX_SHEET_ROWS_FOR_REPLACE}" 
+
+
+    # --- 修正: スコープ競合解消済みの findReplace 処理 ---
     try:
         requests = []
         
         # 1. C列の全セルに対して、曜日パターン (例: (水)) を削除する正規表現置換リクエスト
         requests.append({
             "findReplace": {
-                # 'sheetId' を削除 (gspreadが自動で追加するため、ここにあるとAPIエラーになる)
-                "range": "C2:C", 
+                # 🚨 C2:C ではなく C2:C10000 に指定
+                "range": target_range, 
                 "find": r"\([月火水木金土日]\)", 
                 "replacement": "", 
-                "searchByRegex": True,  # 👈 Sheets API v4の正しい正規表現フラグ
+                "searchByRegex": True,
             }
         })
         # 2. 曜日の直後に残る可能性のあるスペースを削除し、半角スペース1つに統一
         requests.append({
             "findReplace": {
-                # 'sheetId' を削除
-                "range": "C2:C",
+                # 🚨 C2:C ではなく C2:C10000 に指定
+                "range": target_range,
                 "find": r"\s{2,}", 
                 "replacement": " ", 
-                "searchByRegex": True, # 👈 Sheets API v4の正しい正規表現フラグ
+                "searchByRegex": True,
             }
         })
         
-        # worksheet.spreadsheet.batch_update を呼び出すことで、worksheet.id が自動的に適用される
         worksheet.spreadsheet.batch_update({"requests": requests})
         print(" スプレッドシート上でC列の**曜日記載を削除**しました。")
     except Exception as e:
@@ -529,7 +537,7 @@ def sort_yahoo_sheet(gc: gspread.Client):
     print(" SOURCEシートを投稿日時の**新しい順**に並び替えました。")
 
 
-# ====== 本文・コメント数の取得と即時更新 (E, F列) (ロジックは変更なし) ======
+# ====== 本文・コメント数の取得と即時更新 (E, F列) (変更なし) ======
 
 def fetch_details_and_update_sheet(gc: gspread.Client):
     """ E列, F列が未入力の行に対し、詳細取得とC列の日付補完を行い、行ごとに即時更新する """
@@ -601,7 +609,7 @@ def fetch_details_and_update_sheet(gc: gspread.Client):
     print(f" ✅ 本文/コメント数取得と日時補完を {update_count} 行について実行し、即時反映しました。")
 
 
-# ====== Gemini分析の実行と強制中断 (G, H, I列) (ロジックは変更なし) ======
+# ====== Gemini分析の実行と強制中断 (G, H, I列) (変更なし) ======
 
 def analyze_with_gemini_and_update_sheet(gc: gspread.Client):
     """ G列, H列, I列が未入力の行に対し、Gemini分析を行い、分析結果を即時更新する """
