@@ -37,8 +37,8 @@ from google.genai import types
 from google.api_core.exceptions import ResourceExhausted 
 # ------------------------------------
 
-# ====== 設定 (新しいIDに更新 & 最大行数を固定) ======
-SHARED_SPREADSHEET_ID = "1Ru2DT_zzKjTJptchWJitCb67VoffImGhgeOVjwlKukc" # 🚨 IDを更新
+# ====== 設定 ======
+SHARED_SPREADSHEET_ID = "1Ru2DT_zzKjTJptchWJitCb67VoffImGhgeOVjwlKukc" 
 KEYWORD_FILE = "keywords.txt" 
 SOURCE_SPREADSHEET_ID = SHARED_SPREADSHEET_ID
 SOURCE_SHEET_NAME = "Yahoo"
@@ -65,7 +65,7 @@ except Exception as e:
 
 GEMINI_PROMPT_TEMPLATE = None
 
-# ====== ヘルパー関数群 (変更なし) ======
+# ====== ヘルパー関数群 ======
 
 def jst_now() -> datetime:
     return datetime.now(TZ_JST)
@@ -226,7 +226,7 @@ def analyze_with_gemini(text_to_analyze: str) -> Tuple[str, str, str, bool]:
     
     return "ERROR", "ERROR", "ERROR", False
 
-# ====== データ取得関数 (変更なし) ======
+# ====== データ取得関数 (ソース抽出ロジック修正) ======
 
 def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
     print(f"  Yahoo!ニュース検索開始 (キーワード: {keyword})...")
@@ -238,7 +238,6 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument(f"user-agent={REQ_HEADERS['User-Agent']}")
     
-    # スクレイピング対策回避と安定化のためのオプション
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option('useAutomationExtension', False)
@@ -255,13 +254,12 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
     driver.get(search_url)
     
     try:
-        # タイムアウトを20秒に延長し、ECを visibility_of_element_located に変更
         WebDriverWait(driver, 20).until(
             EC.visibility_of_element_located((By.CSS_SELECTOR, "li[class*='sc-1u4589e-0']"))
         )
-        time.sleep(3) # ロード後の追加待機を3秒に
+        time.sleep(3) 
     except Exception as e:
-        print(f"  ⚠️ ページロードまたは要素検索でタイムアウト。全キーワード0件の場合、この警告が原因の可能性が高いです。エラー: {e}")
+        print(f"  ⚠️ ページロードまたは要素検索でタイムアウト。エラー: {e}")
         time.sleep(5) 
     
     soup = BeautifulSoup(driver.page_source, "html.parser")
@@ -280,50 +278,49 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
             link_tag = article.find("a", href=True)
             url = link_tag["href"] if link_tag and link_tag["href"].startswith("https://news.yahoo.co.jp/articles/") else ""
             
-            # --- 投稿日時 (C列) 抽出ロジック ---
+            # --- 投稿日時 (C列) 抽出 ---
             date_str = ""
             time_tag = article.find("time")
             if time_tag:
                 date_str = time_tag.text.strip()
             
-            # --- ソース (D列) 抽出ロジック ---
+            # --- 🚨 修正: ソース (D列) 抽出ロジックの改善 ---
             source_text = ""
             source_container = article.find("div", class_=re.compile("sc-n3vj8g-0"))
             
             if source_container:
-                inner_div = source_container.find("div", class_=re.compile("sc-110wjhy-8"))
-
-                if inner_div:
-                    comment_span = inner_div.find("span", class_=re.compile("sc-jksony-0"))
-                    source_candidate = None
-                    if comment_span:
-                        next_element = comment_span.find_next_sibling()
-                        if next_element and next_element.name == 'span' and not next_element.get('class', [''])[0].startswith('sc-110wjhy-1'):
-                            source_candidate = next_element.text.strip()
-                        elif comment_span.next_sibling and comment_span.next_sibling.strip():
-                            source_candidate = comment_span.next_sibling.strip()
-                    else:
-                        first_span = inner_div.find("span")
-                        if first_span and not first_span.find("svg"):
-                             source_candidate = first_span.text.strip()
-                    
-                    if source_candidate:
-                        # ソース候補が日付や時刻のパターンでないことを確認
-                        if not re.match(r'\d{1,2}/\d{1,2}\([月火水木金土日]\)\d{1,2}:\d{2}', source_candidate) and len(source_candidate) > 0:
-                            source_text = source_candidate
-
+                # タイムスタンプやコメント数の後に続く最初のテキストを探す
+                time_and_comments = source_container.find("div", class_=re.compile("sc-110wjhy-8"))
+                
+                if time_and_comments:
+                    # div内の全てのテキストノードを取得し、日付やコメントの要素のテキストを除去
+                    # シンプルに、timeタグとコメントアイコンのspanタグ以外のspanタグのテキストを取得
+                    source_candidates = [
+                        span.text.strip() for span in time_and_comments.find_all("span") 
+                        if not span.find("svg") # コメントアイコンではない
+                        and not re.match(r'\d{1,2}/\d{1,2}\([月火水木金土日]\)\d{1,2}:\d{2}', span.text.strip()) # 日付ではない
+                    ]
+                    # 最も長い（ソースである可能性が高い）テキストを採用
+                    if source_candidates:
+                        source_text = max(source_candidates, key=len)
+                        
+                    # 上記で取得できない場合、直下のテキストノードを探す
+                    if not source_text:
+                        for content in time_and_comments.contents:
+                            if content.name is None and content.strip() and not re.match(r'\d{1,2}/\d{1,2}\([月火水木金土日]\)\d{1,2}:\d{2}', content.strip()):
+                                source_text = content.strip()
+                                break
+            # ----------------------------------------------------
             
             if title and url:
                 formatted_date = ""
                 if date_str:
                     try:
-                        # parse_post_date を呼び出し、曜日を除去したクリーンな日時オブジェクトを取得
                         dt_obj = parse_post_date(date_str, today_jst)
                         
                         if dt_obj:
                             formatted_date = format_datetime(dt_obj)
                         else:
-                             # パース失敗時は生の文字列から曜日だけ削除して保持 (ソートのため)
                              formatted_date = re.sub(r"\([月火水木金土日]\)$", "", date_str).strip()
                     except:
                         formatted_date = date_str
@@ -335,14 +332,13 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
                     "ソース": source_text if source_text else "取得不可"
                 })
         except Exception as e:
-            # 個別記事のパースエラーはスキップ
             continue
             
     print(f"  Yahoo!ニュース件数: {len(articles_data)} 件取得")
     return articles_data
 
+# ====== 詳細取得関数 (本文複数ページ対応ロジック修正) ======
 def fetch_article_body_and_comments(base_url: str) -> Tuple[str, int, Optional[str]]:
-    # ... (詳細取得ロジックは変更なし)
     full_body_parts = []
     comment_count = 0
     extracted_date_str = None
@@ -362,6 +358,7 @@ def fetch_article_body_and_comments(base_url: str) -> Tuple[str, int, Optional[s
             
             article_content = soup.find("article") or soup.find("div", class_="article_body") or soup.find("div", class_=re.compile("article_detail")) 
 
+            # --- 本文取得 ---
             if article_content:
                 ps = article_content.find_all("p")
                 if ps:
@@ -369,15 +366,14 @@ def fetch_article_body_and_comments(base_url: str) -> Tuple[str, int, Optional[s
                     full_body_parts.append(body_part)
                     
                     if page_num == 1:
-                        # 本文から日付を抽出するロジックはそのまま
                         body_text_partial = " ".join(p.get_text(strip=True) for p in ps[:3] if p.get_text(strip=True))
                         match = re.search(r'(\d{1,2}/\d{1,2})\([月火水木金土日]\)(\s*)(\d{1,2}:\d{2})配信', body_text_partial)
                         if match:
                             month_day = match.group(1)
                             time_str = match.group(3)
-                            # 抽出した文字列は 'MM/DD HH:MM' の形式にする
                             extracted_date_str = f"{month_day} {time_str}"
             
+            # --- コメント数取得 (1ページ目のみ) ---
             if page_num == 1:
                 comment_button = soup.find("button", attrs={"data-cl-params": re.compile(r"cmtmod")})
                 if comment_button:
@@ -387,8 +383,9 @@ def fetch_article_body_and_comments(base_url: str) -> Tuple[str, int, Optional[s
                     if match:
                         comment_count = int(match.group(1))
 
+            # --- 🚨 修正: 次ページリンクの検索ロジック改善 ---
             next_link_tag = soup.find("a", class_=re.compile("sw-Pagination__nextLink"))
-            if next_link_tag and next_link_tag.get('href'):
+            if next_link_tag and next_link_tag.get('href') and not next_link_tag.get('aria-disabled') == 'true':
                 next_url = next_link_tag['href']
                 if next_url.startswith('/'):
                     base_domain = re.match(r'(https?://[^/]+)', base_url)
@@ -410,7 +407,7 @@ def fetch_article_body_and_comments(base_url: str) -> Tuple[str, int, Optional[s
     return body_text, comment_count, extracted_date_str
 
 
-# ====== スプレッドシート操作関数 (sort_yahoo_sheet 関数を修正) ======
+# ====== スプレッドシート操作関数 (ソート/置換ロジックを修正) ======
 
 def set_row_height(ws: gspread.Worksheet, row_height_pixels: int):
     try:
@@ -437,10 +434,8 @@ def set_row_height(ws: gspread.Worksheet, row_height_pixels: int):
 
 def ensure_source_sheet_headers(sh: gspread.Spreadsheet) -> gspread.Worksheet:
     try:
-        # シートが存在すれば取得
         ws = sh.worksheet(SOURCE_SHEET_NAME)
     except gspread.exceptions.WorksheetNotFound:
-        # シートがなければ作成（最大行数も10000行を想定）
         ws = sh.add_worksheet(title=SOURCE_SHEET_NAME, rows=str(MAX_SHEET_ROWS_FOR_REPLACE), cols=str(len(YAHOO_SHEET_HEADERS)))
         
     current_headers = ws.row_values(1)
@@ -458,7 +453,6 @@ def write_news_list_to_source(gc: gspread.Client, articles: list[dict]):
     new_data = [[a['URL'], a['タイトル'], a['投稿日時'], a['ソース']] for a in articles if a['URL'] not in existing_urls]
     
     if new_data:
-        # 新しいデータを最終行に追記
         worksheet.append_rows(new_data, value_input_option='USER_ENTERED')
         print(f"  SOURCEシートに {len(new_data)} 件追記しました。")
     else:
@@ -472,39 +466,30 @@ def sort_yahoo_sheet(gc: gspread.Client):
         print("ソートスキップ: Yahooシートが見つかりません。")
         return
 
-    # 🚨 修正点: 曜日削除の対象範囲を C2:C10000 に固定
+    # 曜日削除の対象範囲を C2:C10000 に固定
     target_range = f"C2:C{MAX_SHEET_ROWS_FOR_REPLACE}" 
 
-
-    # --- 修正: スコープ競合解消済みの findReplace 処理 ---
+    # --- 🚨 修正: worksheet.find_replace() を使用し、APIエラーを回避し確実に置換する ---
     try:
-        requests = []
+        # 1. 曜日パターン (例: (水)) を削除
+        worksheet.find_replace(
+            r"\([月火水木金土日]\)", 
+            "", 
+            search_by_regex=True, 
+            range=target_range
+        )
         
-        # 1. C列の全セルに対して、曜日パターン (例: (水)) を削除する正規表現置換リクエスト
-        requests.append({
-            "findReplace": {
-                # 🚨 C2:C ではなく C2:C10000 に指定
-                "range": target_range, 
-                "find": r"\([月火水木金土日]\)", 
-                "replacement": "", 
-                "searchByRegex": True,
-            }
-        })
         # 2. 曜日の直後に残る可能性のあるスペースを削除し、半角スペース1つに統一
-        requests.append({
-            "findReplace": {
-                # 🚨 C2:C ではなく C2:C10000 に指定
-                "range": target_range,
-                "find": r"\s{2,}", 
-                "replacement": " ", 
-                "searchByRegex": True,
-            }
-        })
+        worksheet.find_replace(
+            r"\s{2,}", 
+            " ", 
+            search_by_regex=True, 
+            range=target_range
+        )
         
-        worksheet.spreadsheet.batch_update({"requests": requests})
         print(" スプレッドシート上でC列の**曜日記載を削除**しました。")
     except Exception as e:
-        # 置換エラーが発生しても、後続のソートを続行できるように print で処理を継続
+        # worksheet.find_replace() はバッチ更新よりも信頼性が高いが、念のためエラー処理を残す
         print(f" ⚠️ スプレッドシート上の置換エラー: {e}") 
     # ----------------------------------------------------
 
