@@ -37,8 +37,8 @@ from google.genai import types
 from google.api_core.exceptions import ResourceExhausted 
 # ------------------------------------
 
-# ====== 設定 (変更なし) ======
-SHARED_SPREADSHEET_ID = "1Ru2DT_zzKjTJptchWJitCb67VoffImGhgeOVjwlKukc"
+# ====== 設定 (新しいIDに更新) ======
+SHARED_SPREADSHEET_ID = "1Ru2DT_zzKjTJptchWJitCb67VoffImGhgeOVjwlKukc" # 🚨 IDを更新
 KEYWORD_FILE = "keywords.txt" 
 SOURCE_SPREADSHEET_ID = SHARED_SPREADSHEET_ID
 SOURCE_SHEET_NAME = "Yahoo"
@@ -467,31 +467,32 @@ def sort_yahoo_sheet(gc: gspread.Client):
         print("ソートスキップ: Yahooシートが見つかりません。")
         return
 
-    # --- 修正: ソート前にシート上で曜日を削除する (APIエラー対策済み) ---
+    # --- 修正: ソート前にシート上で曜日を削除する (sheetIdを削除してスコープ競合を解消) ---
     try:
         requests = []
         
         # 1. C列の全セルに対して、曜日パターン (例: (水)) を削除する正規表現置換リクエスト
         requests.append({
             "findReplace": {
-                "sheetId": worksheet.id,
+                # 'sheetId' を削除 (gspreadが自動で追加するため、ここにあるとAPIエラーになる)
                 "range": "C2:C", 
                 "find": r"\([月火水木金土日]\)", 
                 "replacement": "", 
-                "searchByRegex": True,  # 👈 Sheets API v4の正しいフィールド名
+                "searchByRegex": True,  # 👈 Sheets API v4の正しい正規表現フラグ
             }
         })
         # 2. 曜日の直後に残る可能性のあるスペースを削除し、半角スペース1つに統一
         requests.append({
             "findReplace": {
-                "sheetId": worksheet.id,
+                # 'sheetId' を削除
                 "range": "C2:C",
                 "find": r"\s{2,}", 
                 "replacement": " ", 
-                "searchByRegex": True, # 👈 Sheets API v4の正しいフィールド名
+                "searchByRegex": True, # 👈 Sheets API v4の正しい正規表現フラグ
             }
         })
         
+        # worksheet.spreadsheet.batch_update を呼び出すことで、worksheet.id が自動的に適用される
         worksheet.spreadsheet.batch_update({"requests": requests})
         print(" スプレッドシート上でC列の**曜日記載を削除**しました。")
     except Exception as e:
