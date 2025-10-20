@@ -38,7 +38,7 @@ from google.api_core.exceptions import ResourceExhausted
 # ------------------------------------
 
 # ====== 設定 (変更なし) ======
-SHARED_SPREADSHEET_ID = "1Ru2DT_zzKjTJptchWJitCb67VoffImGhgeOVjwlKukc"
+SHARED_SPREADSHEET_ID = "1Ru2DT_zzKjTJptchWJitCb67VoffImGhgeOVyKukc"
 KEYWORD_FILE = "keywords.txt" 
 SOURCE_SPREADSHEET_ID = SHARED_SPREADSHEET_ID
 SOURCE_SHEET_NAME = "Yahoo"
@@ -467,7 +467,7 @@ def sort_yahoo_sheet(gc: gspread.Client):
         print("ソートスキップ: Yahooシートが見つかりません。")
         return
 
-    # --- 修正: ソート前にシート上で曜日を削除する ---
+    # --- 修正: ソート前にシート上で曜日を削除する (APIエラー対策済み) ---
     try:
         requests = []
         
@@ -475,29 +475,28 @@ def sort_yahoo_sheet(gc: gspread.Client):
         requests.append({
             "findReplace": {
                 "sheetId": worksheet.id,
-                "range": "C2:C", # 2行目からC列全体
-                "find": r"\([月火水木金土日]\)", # 曜日を含む正規表現パターン
+                "range": "C2:C", 
+                "find": r"\([月火水木金土日]\)", 
                 "replacement": "", 
-                "allSheets": False,
-                "regex": True
+                "searchByRegex": True,  # 👈 Sheets API v4の正しいフィールド名
             }
         })
-        # 2. 曜日の直後に残る可能性のあるスペースを削除する
+        # 2. 曜日の直後に残る可能性のあるスペースを削除し、半角スペース1つに統一
         requests.append({
             "findReplace": {
                 "sheetId": worksheet.id,
                 "range": "C2:C",
-                "find": r"\s{2,}", # 2つ以上の連続したスペースを検索
-                "replacement": " ", # 1つのスペースに置換
-                "allSheets": False,
-                "regex": True
+                "find": r"\s{2,}", 
+                "replacement": " ", 
+                "searchByRegex": True, # 👈 Sheets API v4の正しいフィールド名
             }
         })
         
         worksheet.spreadsheet.batch_update({"requests": requests})
         print(" スプレッドシート上でC列の**曜日記載を削除**しました。")
     except Exception as e:
-        print(f" ⚠️ スプレッドシート上の置換エラー: {e}")
+        # 置換エラーが発生しても、後続のソートを続行できるように print で処理を継続
+        print(f" ⚠️ スプレッドシート上の置換エラー: {e}") 
     # ----------------------------------------------------
 
 
@@ -511,6 +510,7 @@ def sort_yahoo_sheet(gc: gspread.Client):
     now = jst_now()
     def sort_key(row):
         if len(row) > 2:
+            # 置換が成功している前提で、曜日なしの形式でパース
             dt = parse_post_date(str(row[2]), now)
             # 日付に変換できない場合は、新しい順のソートでリストの末尾に来るように datetime.min を返す
             return dt if dt else datetime.min.replace(tzinfo=TZ_JST) 
