@@ -4,11 +4,12 @@
 1. keywords.txtから全メーカーを読み込み、順次Yahooシートに記事リストを追記 (A-D列)。
 2. 投稿日時から曜日を確実に削除し、クリーンな形式で格納。
 3. 本文とコメント数を取得し、行ごとにスプレッドシートに即時反映 (E-F列)。
-   -> 記事本文の取得において、**page=N パラメータを使用した複数ページ巡回ロジック**を適用。
+    -> 【改修済】記事本文の取得は**1回のみ**に制限。コメント数のみ毎回更新。
+    -> 【改修済】記事本文の取得において、複数ページ巡回ロジックを削除し、**1ページ目のみ**を取得。404などで取得できない場合はスキップ。
 4. 全記事を投稿日の新しい順に並び替え (A-D列を基準にソート)。
-   -> ソート直前にスプレッドシート上でC列の曜日を**個別 findReplace リクエストで削除**。
+    -> ソート直前にスプレッドシート上でC列の曜日を**個別 findReplace リクエストで削除**。
 5. ソートされた記事に対し、新しいものからGemini分析（G, H, I列）を実行。
-   Gemini分析でクォータ制限エラーが出た場合は、そこで処理を中断する。
+    Gemini分析でクォータ制限エラーが出た場合は、そこで処理を中断する。
 """
 
 import os
@@ -47,7 +48,7 @@ SOURCE_SHEET_NAME = "Yahoo"
 DEST_SPREADSHEET_ID = SHARED_SPREADSHEET_ID
 # 曜日削除の対象とする最大行数を10000に設定
 MAX_SHEET_ROWS_FOR_REPLACE = 10000 
-MAX_PAGES = 10 # 記事本文取得の最大巡回ページ数
+MAX_PAGES = 10 # 記事本文取得の最大巡回ページ数 (※ロジック改修により現在は1ページのみ取得)
 
 YAHOO_SHEET_HEADERS = ["URL", "タイトル", "投稿日時", "ソース", "本文", "コメント数", "対象企業", "カテゴリ分類", "ポジネガ分類"] 
 REQ_HEADERS = {"User-Agent": "Mozilla/5.0"}
@@ -166,7 +167,7 @@ def load_gemini_prompt() -> str:
                 content = f.read().strip()
             if content:
                 combined_instructions.append(content)
-                    
+                        
         if not role_instruction or not combined_instructions:
             print("致命的エラー: プロンプトファイルの内容が不完全または空です。")
             return ""
@@ -190,6 +191,12 @@ def request_with_retry(url: str, max_retries: int = 3) -> Optional[requests.Resp
     for attempt in range(max_retries):
         try:
             res = requests.get(url, headers=REQ_HEADERS, timeout=20)
+            
+            # 💡 改修点②: 404 Client Error の場合、リトライせず None を返して即座にスキップ
+            if res.status_code == 404:
+                print(f"  ❌ ページなし (404 Client Error): {url}")
+                return None
+                
             res.raise_for_status()
             return res
         except requests.exceptions.RequestException as e:
@@ -226,20 +233,20 @@ def analyze_with_gemini(text_to_analyze: str) -> Tuple[str, str, str, bool]:
                 model='gemini-2.5-flash',
                 contents=prompt,
                config=types.GenerateContentConfig(
-                   response_mime_type="application/json",
-                   response_schema={"type": "object", "properties": {
-                       "company_info": {"type": "string", "description": "記事の主題企業名と（）内に共同開発企業名を記載した結果"},
-                       "category": {"type": "string", "description": "企業、モデル、技術などの分類結果"}, 
-                       "sentiment": {"type": "string", "description": "ポジティブ、ニュートラル、ネガティブのいずれか"}
-                   }}
-               ),
+                    response_mime_type="application/json",
+                    response_schema={"type": "object", "properties": {
+                        "company_info": {"type": "string", "description": "記事の主題企業名と（）内に共同開発企業名を記載した結果"},
+                        "category": {"type": "string", "description": "企業、モデル、技術などの分類結果"}, 
+                        "sentiment": {"type": "string", "description": "ポジティブ、ニュートラル、ネガティブのいずれか"}
+                    }}
+                ),
             )
 
             analysis = json.loads(response.text.strip())
             
             company_info = analysis.get("company_info", "N/A") 
             category = analysis.get("category", "N/A")         
-            sentiment = analysis.get("sentiment", "N/A")      
+            sentiment = analysis.get("sentiment", "N/A")       
 
             return company_info, category, sentiment, False
 
@@ -260,7 +267,7 @@ def analyze_with_gemini(text_to_analyze: str) -> Tuple[str, str, str, bool]:
             else:
                 print(f"Gemini分析エラー: {e}")
                 return "ERROR", "ERROR", "ERROR", False 
-    
+        
     return "ERROR", "ERROR", "ERROR", False
 
 # ====== データ取得関数 (ソース抽出ロジック修正) ======
@@ -378,95 +385,75 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
     print(f"  Yahoo!ニュース件数: {len(articles_data)} 件取得")
     return articles_data
 
-# ====== 詳細取得関数 (複数ページ取得ロジックを修正) ======
+# ====== 詳細取得関数 (複数ページ取得ロジックを削除し、1ページ目のみ取得に修正) ======
 def fetch_article_body_and_comments(base_url: str) -> Tuple[str, int, Optional[str]]:
     """
-    記事IDベースの '?page=N' パラメータを使用した複数ページ巡回ロジック。
+    記事IDベースの '?page=N' パラメータを使用した複数ページ巡回ロジックを削除し、
+    1ページ目のみの取得に修正。
     """
-    full_body_parts = []
-    comment_count = 0
+    comment_count = -1 # 💡 改修点①: コメント数が取得できない場合は -1 (未取得)としてマーク
     extracted_date_str = None
     
     # URLから記事IDを取得 (例: aaa7c40ed1706ff109ad5e48ccebbfe598805ffd)
     article_id_match = re.search(r'/articles/([a-f0-9]+)', base_url)
     if not article_id_match:
         print(f"  ❌ URLから記事IDが抽出できませんでした: {base_url}")
-        return "本文取得不可", 0, None
+        return "本文取得不可", -1, None
         
-    article_id = article_id_match.group(1)
-    page_counter = 1
-
-    # MAX_PAGESまでページを巡回
-    while page_counter <= MAX_PAGES:
-        # 1. 巡回用URLを生成
-        current_url = f"https://news.yahoo.co.jp/articles/{article_id}?page={page_counter}"
-
-        # 2. HTML取得とBeautifulSoupの初期化
-        try:
-            response = request_with_retry(current_url) 
-            if not response:
-                break
-            soup = BeautifulSoup(response.text, 'html.parser')
-        except Exception as e:
-            print(f"  ↪️ ページ {page_counter} 取得エラー: {e}")
-            break
-
-        # 3. 記事本文の抽出
-        article_content = soup.find('article') or soup.find('div', class_='article_body') or soup.find('div', class_=re.compile(r'article_detail|article_body'))
-
-        current_body = []
-        if article_content:
-            # 最新のHTML構造に対応したセレクタ
-            paragraphs = article_content.find_all('p', class_=re.compile(r'sc-\w+-0\s+\w+.*highLightSearchTarget'))
-            if not paragraphs: # 上記セレクタで取得できなければ汎用<p>を試す
-                paragraphs = article_content.find_all('p')
-                
-            for p in paragraphs:
-                text = p.get_text(strip=True)
-                if text:
-                    current_body.append(text)
-        
-        # 4. 停止条件の判定: 本文が取得できなければ終了
-        if not current_body:
-            # ページが存在しないか、本文が空であるため、巡回を終了
-            break
-            
-        # 5. 取得した本文を全体に追加
-        full_body_parts.append("\n".join(current_body))
-        
-        print(f"    - 記事本文 ページ {page_counter} を取得しました。")
-
-        # --- コメント数と日時 (1ページ目のみ処理) ---
-        if page_counter == 1:
-            # コメント数を表すボタンまたはリンクを探す
-            comment_button = soup.find("button", attrs={"data-cl-params": re.compile(r"cmtmod")}) or \
-                             soup.find("a", attrs={"data-cl-params": re.compile(r"cmtmod")})
-            if comment_button:
-                # コメント数を含む要素から数字を抽出
-                text = comment_button.get_text(strip=True).replace(",", "")
-                match = re.search(r'(\d+)', text)
-                if match:
-                    comment_count = int(match.group(1))
-
-            # C列補完用の日時を本文の冒頭から抽出（「10/20(月) 15:30配信」形式）
-            if current_body:
-                body_text_partial = " ".join(current_body[:3])
-                match = re.search(r'(\d{1,2}/\d{1,2})\([月火水木金土日]\)(\s*)(\d{1,2}:\d{2})配信', body_text_partial)
-                if match:
-                    month_day = match.group(1)
-                    time_str = match.group(3)
-                    # 曜日・配信を削除した形式 (例: 10/20 15:30)
-                    extracted_date_str = f"{month_day} {time_str}"
-        
-        # 6. 次のページへ
-        page_counter += 1
-        time.sleep(0.5) 
-            
-    # --- ループ終了後の処理 ---
+    # 常に1ページ目（ベースURL）のみを取得
+    current_url = base_url.split('?')[0] # パラメータを削除してベースURLを確保
     
-    # 7. 全本文を結合
-    body_text = "\n\n--- ページ区切り ---\n\n".join(full_body_parts)
+    # 2. HTML取得とBeautifulSoupの初期化
+    response = request_with_retry(current_url) 
+    
+    if not response:
+        # 💡 改修点②: request_with_retryでリトライ後も取得できなかった場合（404を含む）、スキップ
+        print(f"  ❌ 記事本文の取得に失敗したため、本文取得不可を返します。: {current_url}")
+        return "本文取得不可", -1, None
+        
+    print(f"  - 記事本文 ページ 1 を取得しました。")
+    soup = BeautifulSoup(response.text, 'html.parser')
 
+    # 3. 記事本文の抽出 (ページ1のみ)
+    article_content = soup.find('article') or soup.find('div', class_='article_body') or soup.find('div', class_=re.compile(r'article_detail|article_body'))
+
+    current_body = []
+    if article_content:
+        # 最新のHTML構造に対応したセレクタ
+        paragraphs = article_content.find_all('p', class_=re.compile(r'sc-\w+-0\s+\w+.*highLightSearchTarget'))
+        if not paragraphs: # 上記セレクタで取得できなければ汎用<p>を試す
+            paragraphs = article_content.find_all('p')
+            
+        for p in paragraphs:
+            text = p.get_text(strip=True)
+            if text:
+                current_body.append(text)
+    
+    # 4. 本文を結合
+    body_text = "\n".join(current_body)
+    
+    # --- コメント数と日時 ---
+    
+    # コメント数を表すボタンまたはリンクを探す
+    comment_button = soup.find("button", attrs={"data-cl-params": re.compile(r"cmtmod")}) or \
+                        soup.find("a", attrs={"data-cl-params": re.compile(r"cmtmod")})
+    if comment_button:
+        # コメント数を含む要素から数字を抽出
+        text = comment_button.get_text(strip=True).replace(",", "")
+        match = re.search(r'(\d+)', text)
+        if match:
+            comment_count = int(match.group(1)) # 0以上の値
+
+    # C列補完用の日時を本文の冒頭から抽出（「10/20(月) 15:30配信」形式）
+    if body_text:
+        body_text_partial = "\n".join(body_text.split('\n')[:3])
+        match = re.search(r'(\d{1,2}/\d{1,2})\([月火水木金土日]\)(\s*)(\d{1,2}:\d{2})配信', body_text_partial)
+        if match:
+            month_day = match.group(1)
+            time_str = match.group(3)
+            # 曜日・配信を削除した形式 (例: 10/20 15:30)
+            extracted_date_str = f"{month_day} {time_str}"
+            
     return body_text if body_text else "本文取得不可", comment_count, extracted_date_str
 
 
@@ -477,17 +464,17 @@ def set_row_height(ws: gspread.Worksheet, row_height_pixels: int):
         requests = []
         requests.append({
            "updateDimensionProperties": {
-               "range": {
-                   "sheetId": ws.id,
-                   "dimension": "ROWS",
-                   "startIndex": 1, 
-                   "endIndex": ws.row_count 
-               },
-               "properties": {
-                   "pixelSize": row_height_pixels
-               },
-               "fields": "pixelSize"
-           }
+                "range": {
+                    "sheetId": ws.id,
+                    "dimension": "ROWS",
+                    "startIndex": 1, 
+                    "endIndex": ws.row_count 
+                },
+                "properties": {
+                    "pixelSize": row_height_pixels
+                },
+                "fields": "pixelSize"
+            }
         })
         ws.spreadsheet.batch_update({"requests": requests})
         print(f" 2行目以降の**行の高さ**を {row_height_pixels} ピクセルに設定しました。")
@@ -629,10 +616,13 @@ def sort_yahoo_sheet(gc: gspread.Client):
     print(" SOURCEシートを投稿日時の**新しい順**に並び替えました。")
 
 
-# ====== 本文・コメント数の取得と即時更新 (E, F列) ======
+# ====== 本文・コメント数の取得と即時更新 (E, F列) (改修済み) ======
 
 def fetch_details_and_update_sheet(gc: gspread.Client):
-    """ E列, F列が未入力の行に対し、詳細取得とC列の日付補完を行い、行ごとに即時更新する """
+    """ 
+    E列, F列が未入力の行に対し、詳細取得とC列の日付補完を行い、行ごとに即時更新する。
+    💡 改修点: 本文取得は初回のみ。コメント数は毎回更新し、取得失敗時は既存値を維持。
+    """
     
     sh = gc.open_by_key(SOURCE_SPREADSHEET_ID)
     try:
@@ -663,48 +653,62 @@ def fetch_details_and_update_sheet(gc: gspread.Client):
         post_date_raw = str(data_row[2]) # C列
         source = str(data_row[3])        # D列
         body = str(data_row[4])          # E列
-        comment_count = str(data_row[5]) # F列
+        comment_count_str = str(data_row[5]) # F列
         
         if not url.strip() or not url.startswith('http'):
             print(f"  - 行 {row_num}: URLが無効なためスキップ。")
             continue
 
-        # E, F列が空、またはC列が取得不可/空欄の場合は詳細取得が必要
-        needs_details_for_first_time = not body.strip() or not comment_count.strip() or "取得不可" in post_date_raw or not post_date_raw.strip()
+        needs_body_fetch = not body.strip() or body == "本文取得不可" # E列が空、または前回本文取得に失敗している場合
         
-        # ログ出力
-        if needs_details_for_first_time:
-             print(f"  - 行 {row_num} (記事: {title[:20]}...): 本文/コメント数/日時補完を取得中...")
+        
+        new_body = body
+        new_comment_count = comment_count_str
+        new_post_date = post_date_raw
+
+        # --- 詳細取得 ---
+        # 本文の有無に関わらず、毎回 fetch_article_body_and_comments を呼び出す
+        # fetch_article_body_and_comments は常に本文、コメント数、日時を返すように修正されている
+        if needs_body_fetch:
+            print(f"  - 行 {row_num} (記事: {title[:20]}...): 本文/コメント数/日時補完を取得中...")
         else:
-             # 本文/日時が揃っていても、コメント数は毎回更新の対象
-             print(f"  - 行 {row_num} (記事: {title[:20]}...): コメント数を更新中...")
-
-
-        # --- 詳細取得 (C, E, F列の補完) ---
+            print(f"  - 行 {row_num} (記事: {title[:20]}...): コメント数を更新中...")
+            
         fetched_body, fetched_comment_count, extracted_date = fetch_article_body_and_comments(url) 
 
-        # E列(本文): 空、または「本文取得不可」の場合のみ、詳細取得値で更新
-        new_body = fetched_body if not body.strip() or body == "本文取得不可" else body
+        # --- E列(本文)の更新ロジック (本文取得が初めての場合のみ) ---
+        if needs_body_fetch:
+            # 本文取得が初めてで、かつ取得が成功した場合
+            if fetched_body != "本文取得不可":
+                new_body = fetched_body
+            # 本文取得が初めてで、取得が失敗した場合（「本文取得不可」を反映）
+            elif body != "本文取得不可":
+                 new_body = "本文取得不可"
 
-        # 【修正点②】F列(コメント数): 毎回取得し、取得できた場合（0も含む）は無条件に更新
-        # fetched_comment_countはintまたはNone。Noneでない場合は文字列に変換して使用。
-        new_comment_count = str(fetched_comment_count) if fetched_comment_count is not None else comment_count
-
-        # C列(日付): 空または「取得不可」の場合、かつ詳細取得で日時が抽出できた場合にのみ更新
-        new_post_date = post_date_raw
-        if ("取得不可" in post_date_raw or not post_date_raw.strip()) and extracted_date:
-            dt_obj = parse_post_date(extracted_date, jst_now())
-            if dt_obj:
-                # 修正した format_datetime を使用 (【修正点①】日時形式の修正に対応)
-                new_post_date = format_datetime(dt_obj)
-            else:
-                new_post_date = re.sub(r"\([月火水木金土日]\)$", "", extracted_date).strip()
+            # C列(日付)の更新ロジック
+            if ("取得不可" in post_date_raw or not post_date_raw.strip()) and extracted_date:
+                dt_obj = parse_post_date(extracted_date, jst_now())
+                if dt_obj:
+                    new_post_date = format_datetime(dt_obj)
+                else:
+                    new_post_date = re.sub(r"\([月火水木金土日]\)$", "", extracted_date).strip()
         
+        # --- F列(コメント数)の更新ロジック (本文の有無にかかわらず実行) ---
+        # 💡 改修点①: 取得できた場合（-1でない）は更新する。取得失敗時（-1）は既存値を維持。
+        if fetched_comment_count != -1:
+            new_comment_count = str(fetched_comment_count)
+            if new_comment_count != comment_count_str:
+                pass # ログはfetch_article_body_and_comments内で出力済み
+        else:
+            # 取得できなかった場合は既存の数値を維持 (要件①)
+            print(f"    - ⚠️ コメント数の取得に失敗しました。既存の値 ({comment_count_str}) を維持します。")
+
+
         # 更新が必要なセルの判定
         needs_update_to_sheet = (
             new_body != body or
-            str(new_comment_count) != str(comment_count) or # コメント数が変わった
-            new_post_date != post_date_raw # 日付が変わった
+            new_comment_count != comment_count_str or 
+            new_post_date != post_date_raw 
         )
 
         if needs_update_to_sheet:
@@ -751,17 +755,17 @@ def analyze_with_gemini_and_update_sheet(gc: gspread.Client):
         
         url = str(data_row[0]) 
         title = str(data_row[1]) 
-        body = str(data_row[4])          # E列
-        company_info = str(data_row[6])  # G列
-        category = str(data_row[7])      # H列
-        sentiment = str(data_row[8])     # I列
+        body = str(data_row[4])       # E列
+        company_info = str(data_row[6]) # G列
+        category = str(data_row[7])     # H列
+        sentiment = str(data_row[8])    # I列
 
         needs_analysis = not company_info.strip() or not category.strip() or not sentiment.strip()
 
         if not needs_analysis:
             continue
             
-        if not body.strip():
+        if not body.strip() or body == "本文取得不可":
             print(f"  - 行 {row_num}: 本文がないため分析をスキップし、N/Aを設定。")
             
             ws.update(
