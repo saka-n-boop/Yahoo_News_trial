@@ -74,8 +74,8 @@ def jst_now() -> datetime:
     return datetime.now(TZ_JST)
 
 def format_datetime(dt_obj) -> str:
-    # スプレッドシートの表示形式に合わせる
-    return dt_obj.strftime("%y/%m/%d %H:%M")
+    # 【修正点①】日時の表示形式を yyyy/mm/dd hh:mm:ss に変更
+    return dt_obj.strftime("%Y/%m/%d %H:%M:%S") # 2025/10/08 10:00:28 の形式
 
 def parse_post_date(raw, today_jst: datetime) -> Optional[datetime]:
     if raw is None: return None
@@ -83,13 +83,13 @@ def parse_post_date(raw, today_jst: datetime) -> Optional[datetime]:
         s = raw.strip()
         
         # 曜日のパターンを削除する正規表現を確実に実行
-        # 注: この関数はスプレッドシート上の置換後に呼ばれることが多いため、基本的には曜日はない
         s = re.sub(r"\([月火水木金土日]\)$", "", s).strip()
         
         # 配信という文字が残っている場合は削除
         s = s.replace('配信', '').strip()
         
-        for fmt in ("%y/%m/%d %H:%M", "%m/%d %H:%M", "%Y/%m/%d %H:%M", "%Y/%m/%d %H:%M:%S"):
+        # 修正後のフォーマットを含めてパースを試みる
+        for fmt in ("%Y/%m/%d %H:%M:%S", "%y/%m/%d %H:%M", "%m/%d %H:%M", "%Y/%m/%d %H:%M"):
             try:
                 dt = datetime.strptime(s, fmt)
                 if fmt == "%m/%d %H:%M":
@@ -121,9 +121,9 @@ def build_gspread_client() -> gspread.Client:
         else:
             # GCP_SERVICE_ACCOUNT_KEY が設定されていない場合は、ローカルファイル認証を試みる (フォールバック)
             try:
-                 return gspread.service_account(filename='credentials.json')
+                return gspread.service_account(filename='credentials.json')
             except FileNotFoundError:
-                 raise RuntimeError("Google認証情報 (GCP_SERVICE_ACCOUNT_KEY)が環境変数、または 'credentials.json' ファイルに見つかりません。")
+                raise RuntimeError("Google認証情報 (GCP_SERVICE_ACCOUNT_KEY)が環境変数、または 'credentials.json' ファイルに見つかりません。")
 
     except Exception as e:
         raise RuntimeError(f"Google認証に失敗: {e}")
@@ -164,8 +164,8 @@ def load_gemini_prompt() -> str:
             file_path = os.path.join(script_dir, filename)
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read().strip()
-                if content:
-                    combined_instructions.append(content)
+            if content:
+                combined_instructions.append(content)
                     
         if not role_instruction or not combined_instructions:
             print("致命的エラー: プロンプトファイルの内容が不完全または空です。")
@@ -232,14 +232,14 @@ def analyze_with_gemini(text_to_analyze: str) -> Tuple[str, str, str, bool]:
                        "category": {"type": "string", "description": "企業、モデル、技術などの分類結果"}, 
                        "sentiment": {"type": "string", "description": "ポジティブ、ニュートラル、ネガティブのいずれか"}
                    }}
-                ),
+               ),
             )
 
             analysis = json.loads(response.text.strip())
             
             company_info = analysis.get("company_info", "N/A") 
-            category = analysis.get("category", "N/A")          
-            sentiment = analysis.get("sentiment", "N/A")         
+            category = analysis.get("category", "N/A")         
+            sentiment = analysis.get("sentiment", "N/A")      
 
             return company_info, category, sentiment, False
 
@@ -358,6 +358,7 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
                         dt_obj = parse_post_date(date_str, today_jst)
                         
                         if dt_obj:
+                            # 修正した format_datetime を使用し、yyyy/mm/dd hh:mm:ss 形式で格納
                             formatted_date = format_datetime(dt_obj)
                         else:
                             # パース失敗時は曜日だけ削除した生文字列をそのまま保持
@@ -534,7 +535,7 @@ def sort_yahoo_sheet(gc: gspread.Client):
     # 曜日削除の対象範囲を C2:C10000 に固定
     target_range = f"C2:C{MAX_SHEET_ROWS_FOR_REPLACE}" 
 
-    # --- 🚨 修正: 曜日ごとに個別のfindReplaceリクエストを生成 (batch_update 使用) ---
+    # --- 🚨 曜日ごとに個別のfindReplaceリクエストを生成 (batch_update 使用) ---
     try:
         requests = []
         
@@ -542,7 +543,6 @@ def sort_yahoo_sheet(gc: gspread.Client):
         days_of_week = ["月", "火", "水", "木", "金", "土", "日"]
         
         # 1. 各曜日に対応する個別の置換リクエストを生成 (7つのリクエスト)
-        # 正規表現: 例 r"\(月\)"
         for day in days_of_week:
             requests.append({
                 "findReplace": {
@@ -560,7 +560,6 @@ def sort_yahoo_sheet(gc: gspread.Client):
             })
             
         # 2. 曜日の直後に残る可能性のあるスペースや連続するスペースを削除し、半角スペース1つに統一 (1つのリクエスト)
-        # gspread の find_replace は range の指定方法が違うため、batch_update 形式に合わせる
         requests.append({
             "findReplace": {
                 "range": {
@@ -666,47 +665,58 @@ def fetch_details_and_update_sheet(gc: gspread.Client):
         body = str(data_row[4])          # E列
         comment_count = str(data_row[5]) # F列
         
-        # E, F列が空、またはC列が取得不可/空欄の場合に詳細取得が必要
-        needs_details = not body.strip() or not comment_count.strip() or "取得不可" in post_date_raw or not post_date_raw.strip()
-
-        if not needs_details:
-            continue
-            
         if not url.strip() or not url.startswith('http'):
             print(f"  - 行 {row_num}: URLが無効なためスキップ。")
             continue
 
-        print(f"  - 行 {row_num} (記事: {title[:20]}...): 本文/コメント数を取得中...")
+        # E, F列が空、またはC列が取得不可/空欄の場合は詳細取得が必要
+        needs_details_for_first_time = not body.strip() or not comment_count.strip() or "取得不可" in post_date_raw or not post_date_raw.strip()
+        
+        # ログ出力
+        if needs_details_for_first_time:
+             print(f"  - 行 {row_num} (記事: {title[:20]}...): 本文/コメント数/日時補完を取得中...")
+        else:
+             # 本文/日時が揃っていても、コメント数は毎回更新の対象
+             print(f"  - 行 {row_num} (記事: {title[:20]}...): コメント数を更新中...")
+
 
         # --- 詳細取得 (C, E, F列の補完) ---
-        # 戻り値が3つであることを確認して受け取る
         fetched_body, fetched_comment_count, extracted_date = fetch_article_body_and_comments(url) 
 
-        new_body = fetched_body if not body.strip() else body
-        # コメント数が空または '0' の場合にのみ更新
-        new_comment_count = fetched_comment_count if not comment_count.strip() or str(comment_count).strip() == '0' else comment_count
+        # E列(本文): 空、または「本文取得不可」の場合のみ、詳細取得値で更新
+        new_body = fetched_body if not body.strip() or body == "本文取得不可" else body
 
+        # 【修正点②】F列(コメント数): 毎回取得し、取得できた場合（0も含む）は無条件に更新
+        # fetched_comment_countはintまたはNone。Noneでない場合は文字列に変換して使用。
+        new_comment_count = str(fetched_comment_count) if fetched_comment_count is not None else comment_count
+
+        # C列(日付): 空または「取得不可」の場合、かつ詳細取得で日時が抽出できた場合にのみ更新
         new_post_date = post_date_raw
-        # C列が空か「取得不可」で、かつ詳細取得で日時が抽出できた場合にのみC列を更新
         if ("取得不可" in post_date_raw or not post_date_raw.strip()) and extracted_date:
             dt_obj = parse_post_date(extracted_date, jst_now())
             if dt_obj:
+                # 修正した format_datetime を使用 (【修正点①】日時形式の修正に対応)
                 new_post_date = format_datetime(dt_obj)
             else:
-                # パース失敗時は生の文字列から曜日だけ削除して保持 (ソートのため)
                 new_post_date = re.sub(r"\([月火水木金土日]\)$", "", extracted_date).strip()
-
         
-        # C, D, E, F列を即時更新
-        # D列(ソース)はA-D列取得時にセットされているはずだが、念のため取得値を優先する
-        ws.update(
-            range_name=f'C{row_num}:F{row_num}', 
-            values=[[new_post_date, source, new_body, new_comment_count]],
-            value_input_option='USER_ENTERED'
+        # 更新が必要なセルの判定
+        needs_update_to_sheet = (
+            new_body != body or
+            str(new_comment_count) != str(comment_count) or # コメント数が変わった
+            new_post_date != post_date_raw # 日付が変わった
         )
-        update_count += 1
-        time.sleep(1 + random.random() * 0.5) 
 
+        if needs_update_to_sheet:
+            # C, D, E, F列を即時更新
+            ws.update(
+                range_name=f'C{row_num}:F{row_num}', 
+                values=[[new_post_date, source, new_body, new_comment_count]],
+                value_input_option='USER_ENTERED'
+            )
+            update_count += 1
+            time.sleep(1 + random.random() * 0.5)
+        
     print(f" ✅ 本文/コメント数取得と日時補完を {update_count} 行について実行し、即時反映しました。")
 
 
