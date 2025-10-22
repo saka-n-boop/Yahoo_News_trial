@@ -10,8 +10,8 @@
     -> 【改修済】記事本文の取得において、複数ページ巡回ロジックを削除し、**1ページ目のみ**を取得。404などで取得できない場合はスキップ。
 4. 全記事を投稿日の新しい順に並び替え (A-D列を基準にソート)。
     -> ソート直前にスプレッドシート上でC列の曜日を**個別 findReplace リクエストで削除**。
-    -> 【改修後】ソート直前にスプレッドシート上でC列の表示形式を**日時(yyyy/mm/dd hh:mm:ss)に設定**。
-    -> 【改修後】ソートをPythonメモリから**スプレッドシートAPIによるソート**に切り替え。
+    -> 【修正済】ソート直前にスプレッドシート上でC列の表示形式を**日時(yyyy/mm/dd hh:mm:ss)に設定**。
+    -> 【修正済】ソートをPythonメモリから**スプレッドシートAPIによるソート**に切り替え。
 5. ソートされた記事に対し、新しいものからGemini分析（G, H, I列）を実行。
     Gemini分析でクォータ制限エラーが出た場合は、そこで処理を中断する。
 """
@@ -74,6 +74,16 @@ except Exception as e:
 GEMINI_PROMPT_TEMPLATE = None
 
 # ====== ヘルパー関数群 ======
+
+# 【修正点】gspread.utils.col_to_letter の代替関数を定義
+def gspread_util_col_to_letter(col_index: int) -> str:
+    """ gspreadの古いバージョンで col_to_letter がない場合の代替関数 (1-indexed) """
+    if col_index < 1:
+        raise ValueError("Column index must be 1 or greater")
+    
+    # gspread.utils.rowcol_to_a1(1, col_index) を利用してA1表記を取得し、行番号を削除して列文字のみを抽出
+    a1_notation = gspread.utils.rowcol_to_a1(1, col_index)
+    return re.sub(r'\d+', '', a1_notation)
 
 def jst_now() -> datetime:
     return datetime.now(TZ_JST)
@@ -594,12 +604,12 @@ def sort_yahoo_sheet(gc: gspread.Client):
         print(f" ⚠️ スプレッドシート上の置換エラー: {e}")
     # ----------------------------------------------------
 
-    # --- 【改修ポイント②】日時の表示形式変更 ---
+    # --- 【修正ポイント②】日時の表示形式変更 (repeatCellを使用) ---
     try:
         format_requests = []
         # C2からC[last_row]の範囲
         format_requests.append({
-            "updateCells": {
+            "repeatCell": { # updateCells ではなく repeatCell を使用
                 "range": {
                     "sheetId": worksheet.id,
                     "startRowIndex": 1, # 2行目 (データ開始)
@@ -622,12 +632,16 @@ def sort_yahoo_sheet(gc: gspread.Client):
         worksheet.spreadsheet.batch_update({"requests": format_requests})
         print(f" ✅ C列(2行目〜{last_row}行) の表示形式を 'yyyy/mm/dd hh:mm:ss' に設定しました。")
     except Exception as e:
-        print(f" ⚠️ C列の表示形式設定エラー: {e}")
+        # エラー発生時に詳細な情報を表示するためにログを変更
+        print(f" ⚠️ C列の表示形式設定エラー: {e}") 
+        # APIError: [400]: Invalid JSON payload received. Unknown name "cell" at 'requests[0].update_cells': Cannot find field. はこの修正で解消するはず
+        
 
-    # --- 【改修ポイント①】スプレッドシート上でのソート (APIソート) ---
+    # --- 【修正ポイント①】スプレッドシート上でのソート (APIソート) ---
     try:
         last_col_index = len(YAHOO_SHEET_HEADERS) # 9 (I列)
-        last_col_a1 = gspread.utils.col_to_letter(last_col_index)
+        # gspread.utils.col_to_letter の代替関数を使用
+        last_col_a1 = gspread_util_col_to_letter(last_col_index)
         sort_range = f'A2:{last_col_a1}{last_row}'
 
         # C列（3列目）を降順（新しい順）でソート
