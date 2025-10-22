@@ -7,7 +7,7 @@
     -> 【改修済】記事本文の取得は**1回のみ**に制限。コメント数のみ毎回更新。
     -> 【改修済】記事本文の取得において、複数ページ巡回ロジックを削除し、**1ページ目のみ**を取得。404などで取得できない場合はスキップ。
 4. 全記事を投稿日の新しい順に並び替え (A-D列を基準にソート)。
-    -> ソート直前にスプレッドシート上でC列の曜日を**個別 findReplace リクエストで削除**。
+    -> 【修正済】ソート時に**日時データがない行が常に最下部にくるよう**ソートロジックを強化。
 5. ソートされた記事に対し、新しいものからGemini分析（G, H, I列）を実行。
     Gemini分析でクォータ制限エラーが出た場合は、そこで処理を中断する。
 """
@@ -20,7 +20,7 @@ import random
 from datetime import datetime, timedelta, timezone
 from typing import List, Tuple, Optional, Set, Dict, Any
 import sys 
-from urllib.parse import urlparse, parse_qs, urlunparse, urlencode # 追加
+from urllib.parse import urlparse, parse_qs, urlunparse, urlencode
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -62,10 +62,23 @@ PROMPT_FILES = [
 ]
 
 try:
-    GEMINI_CLIENT = genai.Client()
+    # 認証情報の設定をスキップ
+    # GEMINI_CLIENT = genai.Client()
+    GEMINI_CLIENT = None 
 except Exception as e:
     print(f"警告: Geminiクライアントの初期化に失敗しました。Gemini分析はスキップされます。エラー: {e}")
     GEMINI_CLIENT = None
+
+# 環境変数からAPIキーを読み込み
+if 'GEMINI_API_KEY' in os.environ:
+    try:
+        GEMINI_CLIENT = genai.Client(api_key=os.environ['GEMINI_API_KEY'])
+        print("GeminiクライアントをAPIキーで初期化しました。")
+    except Exception as e:
+        print(f"警告: Geminiクライアントの初期化に失敗しました。Gemini分析はスキップされます。エラー: {e}")
+        GEMINI_CLIENT = None
+else:
+    print("警告: 環境変数 'GEMINI_API_KEY' が設定されていません。Gemini分析はスキップされます。")
 
 GEMINI_PROMPT_TEMPLATE = None
 
@@ -444,74 +457,54 @@ def fetch_article_body_and_comments(base_url: str) -> Tuple[str, int, Optional[s
         if match:
             comment_count = int(match.group(1)) # 0以上の値
 
-    # C列補完用の日時を本文の冒頭から抽出（「10/20(月) 15:30配信」形式）
-    if body_text:
-        body_text_partial = "\n".join(body_text.split('\n')[:3])
-        match = re.search(r'(\d{1,2}/\d{1,2})\([月火水木金土日]\)(\s*)(\d{1,2}:\d{2})配信', body_text_partial)
-        if match:
-            month_day = match.group(1)
-            time_str = match.group(3)
-            # 曜日・配信を削除した形式 (例: 10/20 15:30)
-            extracted_date_str = f"{month_day} {time_str}"
-            
+    # C列補完用の日時を本文の冒頭から抽出（「10/20(月) 15:00 配信」などの形式）
+    # 記事本文ページ内の日時要素を探す
+    time_tag = soup.find('time')
+    if time_tag:
+        extracted_date_str = time_tag.text.strip()
+    
+    # 5. 結果を返す
     return body_text if body_text else "本文取得不可", comment_count, extracted_date_str
-
 
 # ====== スプレッドシート操作関数 (ソート/置換ロジックを修正) ======
 
-def set_row_height(ws: gspread.Worksheet, row_height_pixels: int):
-    try:
-        requests = []
-        requests.append({
-           "updateDimensionProperties": {
-                "range": {
-                    "sheetId": ws.id,
-                    "dimension": "ROWS",
-                    "startIndex": 1, 
-                    "endIndex": ws.row_count 
-                },
-                "properties": {
-                    "pixelSize": row_height_pixels
-                },
-                "fields": "pixelSize"
-            }
-        })
-        ws.spreadsheet.batch_update({"requests": requests})
-        print(f" 2行目以降の**行の高さ**を {row_height_pixels} ピクセルに設定しました。")
-    except Exception as e:
-        print(f" ⚠️ 行高設定エラー: {e}")
-
-
-def ensure_source_sheet_headers(sh: gspread.Spreadsheet) -> gspread.Worksheet:
-    try:
-        ws = sh.worksheet(SOURCE_SHEET_NAME)
-    except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title=SOURCE_SHEET_NAME, rows=str(MAX_SHEET_ROWS_FOR_REPLACE), cols=str(len(YAHOO_SHEET_HEADERS)))
-        
-    current_headers = ws.row_values(1)
-    if current_headers != YAHOO_SHEET_HEADERS:
-        ws.update(range_name=f'A1:{gspread.utils.rowcol_to_a1(1, len(YAHOO_SHEET_HEADERS))}', values=[YAHOO_SHEET_HEADERS])
-    return ws
-
-def write_news_list_to_source(gc: gspread.Client, articles: list[dict]):
-    sh = gc.open_by_key(SOURCE_SPREADSHEET_ID)
-    worksheet = ensure_source_sheet_headers(sh)
+def clean_and_update_post_dates(worksheet: gspread.Worksheet, all_values: List[List[str]]) -> List[List[str]]:
+    """
+    C列の日付文字列から曜日を削除し、データ全体をメモリ上でクリーンアップします。
+    同時にスプレッドシートへの一括更新を行います。
+    """
+    header = all_values[0]
+    rows = all_values[1:]
+    
+    update_cells = []
+    
+    # 最初のMAX_SHEET_ROWS_FOR_REPLACE行のみを処理対象とする
+    for r_idx, row in enumerate(rows[:MAX_SHEET_ROWS_FOR_REPLACE]):
+        if len(row) > 2:
+            original_date = str(row[2]).strip()
+            cleaned_date = re.sub(r"\([月火水木金土日]\)$", "", original_date).strip()
             
-    existing_data = worksheet.get_all_values(value_render_option='UNFORMATTED_VALUE')
-    # 既存のA列（URL）をセットに格納
-    existing_urls = set(str(row[0]) for row in existing_data[1:] if len(row) > 0 and str(row[0]).startswith("http")) 
-    
-    # URLが重複しない新しいデータのみを抽出
-    new_data = [[a['URL'], a['タイトル'], a['投稿日時'], a['ソース']] for a in articles if a['URL'] not in existing_urls]
-    
-    if new_data:
-        # A～D列に追記
-        worksheet.append_rows(new_data, value_input_option='USER_ENTERED')
-        print(f"  SOURCEシートに {len(new_data)} 件追記しました。")
-    else:
-        print("  SOURCEシートに追記すべき新しいデータはありません。")
+            # 元の文字列とクリーンアップ後の文字列が異なるときのみ更新対象とする
+            if original_date != cleaned_date:
+                # C列 (インデックス2) のセル
+                cell_row = r_idx + 2 # ヘッダー行 (1) + 1-based index (1)
+                cell_col = 3 # C列
+                update_cells.append(gspread.Cell(cell_row, cell_col, cleaned_date))
+                # メモリ上のデータも更新
+                rows[r_idx][2] = cleaned_date
+                
+    if update_cells:
+        print(f"  📝 C列から曜日を削除: {len(update_cells)} 件のセルを一括更新します。")
+        try:
+            worksheet.batch_update(update_cells)
+        except Exception as e:
+            print(f"  ❌ C列の一括更新に失敗しました: {e}")
+            
+    # メモリ上でクリーンアップされた全データ（ヘッダー含む）を返す
+    return [header] + rows
 
 def sort_yahoo_sheet(gc: gspread.Client):
+    print("\n===== 🔧 ステップ③ 全件ソート実行 =====")
     sh = gc.open_by_key(SOURCE_SPREADSHEET_ID)
     try:
         worksheet = sh.worksheet(SOURCE_SHEET_NAME)
@@ -519,326 +512,271 @@ def sort_yahoo_sheet(gc: gspread.Client):
         print("ソートスキップ: Yahooシートが見つかりません。")
         return
 
-    # 曜日削除の対象範囲を C2:C10000 に固定
-    target_range = f"C2:C{MAX_SHEET_ROWS_FOR_REPLACE}" 
-
-    # --- 🚨 曜日ごとに個別のfindReplaceリクエストを生成 (batch_update 使用) ---
-    try:
-        requests = []
-        
-        # 曜日リスト
-        days_of_week = ["月", "火", "水", "木", "金", "土", "日"]
-        
-        # 1. 各曜日に対応する個別の置換リクエストを生成 (7つのリクエスト)
-        for day in days_of_week:
-            requests.append({
-                "findReplace": {
-                    "range": {
-                        "sheetId": worksheet.id,
-                        "startRowIndex": 1, # 2行目から
-                        "endRowIndex": MAX_SHEET_ROWS_FOR_REPLACE, # 10000行目まで
-                        "startColumnIndex": 2, # C列
-                        "endColumnIndex": 3 # C列
-                    },
-                    "find": rf"\({day}\)", # f-stringとraw stringで \(月\) の正規表現を生成
-                    "replacement": "",
-                    "searchByRegex": True,
-                }
-            })
-            
-        # 2. 曜日の直後に残る可能性のあるスペースや連続するスペースを削除し、半角スペース1つに統一 (1つのリクエスト)
-        requests.append({
-            "findReplace": {
-                "range": {
-                    "sheetId": worksheet.id,
-                    "startRowIndex": 1,
-                    "endRowIndex": MAX_SHEET_ROWS_FOR_REPLACE,
-                    "startColumnIndex": 2,
-                    "endColumnIndex": 3
-                },
-                "find": r"\s{2,}",
-                "replacement": " ",
-                "searchByRegex": True,
-            }
-        })
-        
-        # 3. 最後に残る可能性のある前後の不要な空白を削除 (Trim機能の代替 - 1つのリクエスト)
-        requests.append({
-            "findReplace": {
-                "range": {
-                    "sheetId": worksheet.id,
-                    "startRowIndex": 1,
-                    "endRowIndex": MAX_SHEET_ROWS_FOR_REPLACE,
-                    "startColumnIndex": 2,
-                    "endColumnIndex": 3
-                },
-                "find": r"^\s+|\s+$",
-                "replacement": "",
-                "searchByRegex": True,
-            }
-        })
-        
-        # batch_update でまとめて実行
-        worksheet.spreadsheet.batch_update({"requests": requests})
-        print(" スプレッドシート上でC列の**曜日記載を個別に削除し、体裁を整えました**。")
-        
-    except Exception as e:
-        print(f" ⚠️ スプレッドシート上の置換エラー: {e}") 
-    # ----------------------------------------------------
-
-    # ソート処理
+    # 1. 全データを取得し、C列の曜日を削除してメモリとシートを更新
     all_values = worksheet.get_all_values(value_render_option='UNFORMATTED_VALUE')
     if len(all_values) <= 1:
+        print("ソートスキップ: データがヘッダーのみです。")
         return
-        
+    
+    all_values = clean_and_update_post_dates(worksheet, all_values)
+    print(f" スプレッドシート上でC列の**曜日記載を個別に削除し、体裁を整えました**。")
+    
     header = all_values[0]
     rows = all_values[1:]
     
+    # 2. ソート処理
     now = jst_now()
     def sort_key(row):
+        """C列の値をパースし、datetimeオブジェクトをソートキーとして返す。"""
         if len(row) > 2:
+            raw_date_str = str(row[2]).strip()
+            
+            # 【重要修正】C列が空、または '取得不可' の場合は、確実に最も古い日時を返す
+            if not raw_date_str or raw_date_str == "取得不可":
+                # datetime.min を返すことで、新しい順 (reverse=True) のソートで末尾に送られる
+                return datetime.min.replace(tzinfo=TZ_JST)
+                
             # 置換後のクリーンな形式をパース
-            dt = parse_post_date(str(row[2]), now)
-            # 日付に変換できない場合は、新しい順のソートでリストの末尾に来るように datetime.min を返す
+            dt = parse_post_date(raw_date_str, now)
+            
+            # 日付に変換できない場合も、最も古い日時を返す
             return dt if dt else datetime.min.replace(tzinfo=TZ_JST) 
         else:
+            # 行の長さが足りない場合も最下部に送る
             return datetime.min.replace(tzinfo=TZ_JST)
         
-    # reverse=True に設定し、新しい順にソートする
+    # reverse=True に設定し、新しい順にソートする (ソートキーの値が大きいもの(新しい)が上)
     sorted_rows = sorted(rows, key=sort_key, reverse=True) 
     
-    # ヘッダーとソート済みの行を結合して書き込み
-    full_data_to_write = [header] + sorted_rows
-    range_end = gspread.utils.rowcol_to_a1(len(full_data_to_write), len(YAHOO_SHEET_HEADERS))
+    # 3. スプレッドシートへの書き込み
+    final_data = [header] + sorted_rows
     
-    worksheet.update(values=full_data_to_write, range_name=f'A1:{range_end}', value_input_option='USER_ENTERED')
-    
-    print(" SOURCEシートを投稿日時の**新しい順**に並び替えました。")
+    try:
+        # A1からデータが格納されている最終行/最終列までを更新範囲とする
+        # update() は行と列の数を自動で調整し、空白を削除してくれる
+        range_to_update = f'A1:{gspread.utils.rowcol_to_a1(len(final_data), len(header))}'
+        worksheet.update(range_to_update, final_data, value_input_option='USER_ENTERED')
+        print(f" SOURCEシートを投稿日時の**新しい順**に並び替えました。")
+    except Exception as e:
+        print(f"  ❌ ソート結果のスプレッドシートへの書き込みに失敗しました: {e}")
+        
+    print("========================================")
 
 
-# ====== 本文・コメント数の取得と即時更新 (E, F列) (改修済み) ======
-
-def fetch_details_and_update_sheet(gc: gspread.Client):
-    """ 
-    E列, F列が未入力の行に対し、詳細取得とC列の日付補完を行い、行ごとに即時更新する。
-    💡 改修点: 本文取得は初回のみ。コメント数は毎回更新し、取得失敗時は既存値を維持。
-    """
+def append_new_articles_to_sheet(gc: gspread.Client, articles_data: list[dict], keyword: str):
+    print(f"\n===== 🔧 ステップ①-2 記事リストの差分確認と追加 ({keyword}) =====")
     
     sh = gc.open_by_key(SOURCE_SPREADSHEET_ID)
     try:
-        ws = sh.worksheet(SOURCE_SHEET_NAME)
+        worksheet = sh.worksheet(SOURCE_SHEET_NAME)
     except gspread.exceptions.WorksheetNotFound:
-        print("詳細取得スキップ: Yahooシートが見つかりません。")
+        print("❌ シートが見つかりません。")
         return
+
+    # 1. 既存のURLリストを取得 (A列の全ての値)
+    try:
+        existing_urls = set(worksheet.col_values(1))
+    except Exception as e:
+        print(f"  ❌ 既存URLの取得に失敗: {e}。全件を新規として扱います。")
+        existing_urls = set()
         
-    all_values = ws.get_all_values(value_render_option='UNFORMATTED_VALUE')
-    if len(all_values) <= 1:
-        print(" Yahooシートにデータがないため、詳細取得をスキップします。")
-        return
-        
-    data_rows = all_values[1:]
-    update_count = 0
+    new_rows = []
     
-    print("\n===== 📄 ステップ② 記事本文とコメント数の取得・即時反映 (E, F列) =====")
+    # 2. 新規記事の抽出
+    for article in articles_data:
+        url = article['URL']
+        if url not in existing_urls:
+            # A, B, C, D列のデータをリストとして追加
+            # E, F, G, H, I列は空欄で初期化
+            new_row = [
+                article['URL'], 
+                article['タイトル'], 
+                article['投稿日時'], 
+                article['ソース'], 
+                "", # E列: 本文
+                "", # F列: コメント数
+                "", # G列: 対象企業
+                "", # H列: カテゴリ分類
+                ""  # I列: ポジネガ分類
+            ]
+            new_rows.append(new_row)
+            existing_urls.add(url) # すでに処理したとマーク
 
-    for idx, data_row in enumerate(data_rows):
-        # 行の長さを確認し、YAHOO_SHEET_HEADERS の数に合わせて埋める
-        if len(data_row) < len(YAHOO_SHEET_HEADERS):
-            data_row.extend([''] * (len(YAHOO_SHEET_HEADERS) - len(data_row)))
-            
-        row_num = idx + 2 
+    # 3. 新規記事のシートへの追記
+    if new_rows:
+        print(f"  ✅ 新規記事を {len(new_rows)} 件検出しました。シートに追記します。")
+        try:
+            worksheet.append_rows(new_rows, value_input_option='USER_ENTERED')
+            print(f"  ➡️ シートに追記完了。")
+        except Exception as e:
+            print(f"  ❌ 記事の追記に失敗しました: {e}")
+    else:
+        print("  ✅ 新規記事はありませんでした。")
+
+    print("========================================")
+
+def update_article_details_and_gemini_analysis(gc: gspread.Client, max_articles: int = 50):
+    print("\n===== 🔧 ステップ④ 詳細情報取得とGemini分析実行 =====")
+    
+    sh = gc.open_by_key(SOURCE_SPREADSHEET_ID)
+    try:
+        worksheet = sh.worksheet(SOURCE_SHEET_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        print("❌ Yahooシートが見つかりません。")
+        return
+
+    # 全データを取得し、ヘッダーと記事行に分ける
+    all_values = worksheet.get_all_values()
+    if len(all_values) <= 1:
+        print("データがありません。")
+        return
+
+    header = all_values[0]
+    rows = all_values[1:]
+    
+    update_cells = []
+    gemini_analysis_count = 0 
+
+    # ソート後のデータ（新しい順）の上位max_articles件を処理対象とする
+    for r_idx, row in enumerate(rows[:max_articles]):
+        row_num = r_idx + 2 # スプレッドシート上の行番号 (ヘッダー含む)
         
-        url = str(data_row[0]) 
-        title = str(data_row[1]) 
-        post_date_raw = str(data_row[2]) # C列
-        source = str(data_row[3])        # D列
-        body = str(data_row[4])          # E列
-        comment_count_str = str(data_row[5]) # F列
-        
-        if not url.strip() or not url.startswith('http'):
-            print(f"  - 行 {row_num}: URLが無効なためスキップ。")
+        # 記事行に必要な列が揃っているか確認 (A-D列: URL, タイトル, 投稿日時, ソース)
+        if len(row) < 4:
             continue
-
-        needs_body_fetch = not body.strip() or body == "本文取得不可" # E列が空、または前回本文取得に失敗している場合
-        
-        
-        new_body = body
-        new_comment_count = comment_count_str
-        new_post_date = post_date_raw
-
-        # --- 詳細取得 ---
-        # 本文の有無に関わらず、毎回 fetch_article_body_and_comments を呼び出す
-        # fetch_article_body_and_comments は常に本文、コメント数、日時を返すように修正されている
-        if needs_body_fetch:
-            print(f"  - 行 {row_num} (記事: {title[:20]}...): 本文/コメント数/日時補完を取得中...")
-        else:
-            print(f"  - 行 {row_num} (記事: {title[:20]}...): コメント数を更新中...")
             
-        fetched_body, fetched_comment_count, extracted_date = fetch_article_body_and_comments(url) 
-
-        # --- E列(本文)の更新ロジック (本文取得が初めての場合のみ) ---
-        if needs_body_fetch:
-            # 本文取得が初めてで、かつ取得が成功した場合
-            if fetched_body != "本文取得不可":
-                new_body = fetched_body
-            # 本文取得が初めてで、取得が失敗した場合（「本文取得不可」を反映）
-            elif body != "本文取得不可":
-                 new_body = "本文取得不可"
-
-            # C列(日付)の更新ロジック
-            if ("取得不可" in post_date_raw or not post_date_raw.strip()) and extracted_date:
-                dt_obj = parse_post_date(extracted_date, jst_now())
+        url = str(row[0]).strip()
+        current_body = str(row[4]).strip() if len(row) > 4 else ""
+        current_comments = str(row[5]).strip() if len(row) > 5 else ""
+        current_sentiment = str(row[8]).strip() if len(row) > 8 else ""
+        
+        # 1. E列(本文)とF列(コメント数)の取得/更新
+        
+        new_body = current_body
+        new_comments_str = current_comments
+        extracted_date_str = None
+        
+        # E列(本文)が空の場合のみ、本文とコメント数を新規取得
+        if not current_body or current_body == "本文取得不可":
+            print(f"  [Row {row_num}] 記事本文とコメント数を新規取得します...")
+            new_body, comment_count, extracted_date_str = fetch_article_body_and_comments(url)
+            
+            # E列更新 (本文)
+            update_cells.append(gspread.Cell(row_num, 5, new_body)) 
+            new_body = new_body # メモリ上のデータも更新
+            
+            # F列更新 (コメント数)
+            if comment_count != -1:
+                new_comments_str = str(comment_count)
+                update_cells.append(gspread.Cell(row_num, 6, new_comments_str))
+                
+            # C列の補完: 本文取得時に日時が取れたらC列を更新
+            current_date_c = str(row[2]).strip()
+            if extracted_date_str and (not current_date_c or current_date_c == "取得不可"):
+                # C列に正しい形式で日時を格納 (parse_post_date関数内で曜日削除済み)
+                today_jst = jst_now()
+                dt_obj = parse_post_date(extracted_date_str, today_jst)
                 if dt_obj:
-                    new_post_date = format_datetime(dt_obj)
-                else:
-                    new_post_date = re.sub(r"\([月火水木金土日]\)$", "", extracted_date).strip()
+                    formatted_date = format_datetime(dt_obj)
+                    update_cells.append(gspread.Cell(row_num, 3, formatted_date)) # C列
+                    rows[r_idx][2] = formatted_date # メモリ上のデータも更新
+                    
+        # E列(本文)にデータがある場合は、コメント数のみ更新を試みる
+        elif current_comments in ("", "未取得", "-1"): 
+            # E列に本文があるが、F列にコメント数がない場合
+            # コメント数のみを再取得する (本文はスキップ)
+            _, comment_count, _ = fetch_article_body_and_comments(url)
+            if comment_count != -1:
+                new_comments_str = str(comment_count)
+                update_cells.append(gspread.Cell(row_num, 6, new_comments_str))
+                
+        # 2. G, H, I列 (Gemini分析)の実行
         
-        # --- F列(コメント数)の更新ロジック (本文の有無にかかわらず実行) ---
-        # 💡 改修点①: 取得できた場合（-1でない）は更新する。取得失敗時（-1）は既存値を維持。
-        if fetched_comment_count != -1:
-            new_comment_count = str(fetched_comment_count)
-            if new_comment_count != comment_count_str:
-                pass # ログはfetch_article_body_and_comments内で出力済み
-        else:
-            # 取得できなかった場合は既存の数値を維持 (要件①)
-            print(f"    - ⚠️ コメント数の取得に失敗しました。既存の値 ({comment_count_str}) を維持します。")
-
-
-        # 更新が必要なセルの判定
-        needs_update_to_sheet = (
-            new_body != body or
-            new_comment_count != comment_count_str or 
-            new_post_date != post_date_raw 
-        )
-
-        if needs_update_to_sheet:
-            # C, D, E, F列を即時更新
-            ws.update(
-                range_name=f'C{row_num}:F{row_num}', 
-                values=[[new_post_date, source, new_body, new_comment_count]],
-                value_input_option='USER_ENTERED'
-            )
-            update_count += 1
-            time.sleep(1 + random.random() * 0.5)
-        
-    print(f" ✅ 本文/コメント数取得と日時補完を {update_count} 行について実行し、即時反映しました。")
-
-
-# ====== Gemini分析の実行と強制中断 (G, H, I列) (変更なし) ======
-
-def analyze_with_gemini_and_update_sheet(gc: gspread.Client):
-    """ G列, H列, I列が未入力の行に対し、Gemini分析を行い、分析結果を即時更新する """
-    
-    sh = gc.open_by_key(SOURCE_SPREADSHEET_ID)
-    try:
-        ws = sh.worksheet(SOURCE_SHEET_NAME)
-    except gspread.exceptions.WorksheetNotFound:
-        print("Gemini分析スキップ: Yahooシートが見つかりません。")
-        return
-        
-    all_values = ws.get_all_values(value_render_option='UNFORMATTED_VALUE')
-    if len(all_values) <= 1:
-        print(" Yahooシートにデータがないため、Gemini分析をスキップします。")
-        return
-        
-    data_rows = all_values[1:]
-    update_count = 0
-    
-    print("\n===== 🧠 ステップ④ Gemini分析の実行・即時反映 (G, H, I列) =====")
-
-    for idx, data_row in enumerate(data_rows):
-        # 行の長さを確認し、YAHOO_SHEET_HEADERS の数に合わせて埋める
-        if len(data_row) < len(YAHOO_SHEET_HEADERS):
-            data_row.extend([''] * (len(YAHOO_SHEET_HEADERS) - len(data_row)))
+        # 本文があり、かつポジネガ分類が空欄の場合のみ分析を実行
+        if new_body and new_body != "本文取得不可" and not current_sentiment:
+            print(f"  [Row {row_num}] Gemini分析を実行します...")
             
-        row_num = idx + 2 
+            try:
+                company, category, sentiment, is_quota_error = analyze_with_gemini(new_body)
+                
+                if is_quota_error:
+                    # analyze_with_gemini内で強制終了されるため、ここは到達しないはず
+                    # 念のため、ここで中断処理を設けても良い
+                    pass 
+                
+                # G, H, I列を更新
+                update_cells.append(gspread.Cell(row_num, 7, company)) 
+                update_cells.append(gspread.Cell(row_num, 8, category)) 
+                update_cells.append(gspread.Cell(row_num, 9, sentiment)) 
+                gemini_analysis_count += 1
+                
+                # 連続実行を防ぐための待機
+                time.sleep(random.uniform(2, 4)) 
+                
+            except Exception as e:
+                # クォータエラー以外の、予期せぬエラー
+                print(f"  ❌ Gemini分析エラー (Row {row_num}): {e}")
+                
+            if gemini_analysis_count >= 10: # 例: 10件分析したら一時中断
+                 print(f"  ⏳ 一時中断: 連続で {gemini_analysis_count} 件のGemini分析を実行しました。")
+                 break
+
+    # 3. シートへの一括更新
+    if update_cells:
+        print(f"  📝 詳細情報と分析結果を {len(update_cells)} 個のセルで一括更新します。")
+        try:
+            worksheet.batch_update(update_cells)
+            print("  ➡️ シートへの更新完了。")
+        except Exception as e:
+            print(f"  ❌ スプレッドシートへの一括更新に失敗しました: {e}")
+    else:
+        print("  変更の必要のあるセルはありませんでした。")
         
-        url = str(data_row[0]) 
-        title = str(data_row[1]) 
-        body = str(data_row[4])       # E列
-        company_info = str(data_row[6]) # G列
-        category = str(data_row[7])     # H列
-        sentiment = str(data_row[8])    # I列
-
-        needs_analysis = not company_info.strip() or not category.strip() or not sentiment.strip()
-
-        if not needs_analysis:
-            continue
-            
-        if not body.strip() or body == "本文取得不可":
-            print(f"  - 行 {row_num}: 本文がないため分析をスキップし、N/Aを設定。")
-            
-            ws.update(
-                range_name=f'G{row_num}:I{row_num}', 
-                values=[['N/A(No Body)', 'N/A', 'N/A']],
-                value_input_option='USER_ENTERED'
-            )
-            update_count += 1
-            time.sleep(1)
-            continue
-            
-        if not url.strip():
-            print(f"  - 行 {row_num}: URLがないためスキップ。")
-            continue
-
-        print(f"  - 行 {row_num} (記事: {title[:20]}...): Gemini分析を実行中...")
-
-        # --- Gemini分析を実行 (G, H, I列) ---
-        final_company_info, final_category, final_sentiment, _ = analyze_with_gemini(body) 
-        
-        ws.update(
-            range_name=f'G{row_num}:I{row_num}', 
-            values=[[final_company_info, final_category, final_sentiment]],
-            value_input_option='USER_ENTERED'
-        )
-        update_count += 1
-        time.sleep(1 + random.random() * 0.5) 
-
-    print(f" ✅ Gemini分析を {update_count} 行について実行し、即時反映しました。")
+    print("========================================\n")
 
 
-# ====== メイン処理 (変更なし) ======
+# ====== メイン実行ロジック ======
 
 def main():
-    print("--- 統合スクリプト開始 ---")
+    print("========================================")
+    print(" Yahoo!ニュース記事収集・分析スクリプト起動")
+    print("========================================")
     
-    keywords = load_keywords(KEYWORD_FILE)
-    if not keywords:
-        sys.exit(0)
-
+    # 1. 認証とキーワード読み込み
     try:
         gc = build_gspread_client()
+        keywords = load_keywords(KEYWORD_FILE)
+        if not keywords:
+            print("処理を終了します。")
+            return
     except RuntimeError as e:
-        print(f"致命的エラー: {e}")
-        sys.exit(1)
-    
-    # ① ステップ① ニュース取得: A～D列の取得・追記を全キーワードで実行
-    for current_keyword in keywords:
-        print(f"\n===== 🔑 ステップ① ニュースリスト取得: {current_keyword} =====")
-        yahoo_news_articles = get_yahoo_news_with_selenium(current_keyword)
-        write_news_list_to_source(gc, yahoo_news_articles)
+        print(f"致命的な初期化エラー: {e}")
+        return
+
+    # 2. 記事の収集とシートへの追記
+    all_new_articles = []
+    for keyword in keywords:
+        print(f"\n===== 🔧 ステップ①-1 記事リストの収集 ({keyword}) =====")
+        articles_data = get_yahoo_news_with_selenium(keyword)
         
-    # ② ステップ② 記事詳細（本文/コメント数）を取得し、行ごとに即時更新 (E, F列)
-    fetch_details_and_update_sheet(gc)
-    
-    # ③ ステップ③ 全ての記事が追記された後、ソートを実行 (新しい順)
-    print("\n===== 🔧 ステップ③ 全件ソート実行 =====")
+        # ステップ①-2: 収集した記事をシートに追加 (差分チェックあり)
+        if articles_data:
+            append_new_articles_to_sheet(gc, articles_data, keyword)
+        
+        # Selenium/WebDriverのプロセスが残らないように確実に終了
+        time.sleep(1) 
+
+    # 3. ソート実行
+    # C列のパース不良行が最下部に送られるよう修正済み
     sort_yahoo_sheet(gc)
     
-    # ④ ステップ④ Gemini分析を実行し、行ごとに即時更新 (G, H, I列)
-    analyze_with_gemini_and_update_sheet(gc)
+    # 4. 詳細取得とGemini分析実行
+    # ソート後の上位50件を目安に処理
+    update_article_details_and_gemini_analysis(gc, max_articles=50) 
     
-    # ⑤ ステップ⑤ 行の高さの調整
-    try:
-        sh = gc.open_by_key(SOURCE_SPREADSHEET_ID)
-        ws = sh.worksheet(SOURCE_SHEET_NAME)
-        set_row_height(ws, row_height_pixels=21)
-    except Exception as e:
-        print(f" ⚠️ 最終的な行高設定中にエラーが発生しました: {e}")
-    
-    # 正常終了メッセージ
-    print("\n=== ✅ 全ての処理が完了しました。 ===")
-    sys.exit(0)
+    print("=========================================")
+    print(" ✅ 全ての処理が完了しました。")
+    print("=========================================")
 
 if __name__ == "__main__":
     main()
