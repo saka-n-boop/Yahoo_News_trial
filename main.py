@@ -605,16 +605,16 @@ def sort_yahoo_sheet(gc: gspread.Client):
     # ----------------------------------------------------
 
     # --- 【修正ポイント②】日時の表示形式変更 (repeatCellを使用) ---
+    # --- 【修正ポイント】書式設定後にsleepを追加 ---
     try:
         format_requests = []
-        # C2からC[last_row]の範囲
         format_requests.append({
-            "repeatCell": { # updateCells ではなく repeatCell を使用
+            "repeatCell": {
                 "range": {
                     "sheetId": worksheet.id,
-                    "startRowIndex": 1, # 2行目 (データ開始)
+                    "startRowIndex": 1,
                     "endRowIndex": last_row,
-                    "startColumnIndex": 2, # C列 (3列目)
+                    "startColumnIndex": 2,
                     "endColumnIndex": 3
                 },
                 "cell": {
@@ -628,15 +628,35 @@ def sort_yahoo_sheet(gc: gspread.Client):
                 "fields": "userEnteredFormat.numberFormat"
             }
         })
-        
         worksheet.spreadsheet.batch_update({"requests": format_requests})
         print(f" ✅ C列(2行目〜{last_row}行) の表示形式を 'yyyy/mm/dd hh:mm:ss' に設定しました。")
+        time.sleep(2)
     except Exception as e:
-        # エラー発生時に詳細な情報を表示するためにログを変更
         print(f" ⚠️ C列の表示形式設定エラー: {e}") 
-        # APIError: [400]: Invalid JSON payload received. Unknown name "cell" at 'requests[0].update_cells': Cannot find field. はこの修正で解消するはず
-        
 
+    # --- Google Sheets APIのsortRangeリクエスト ---
+    try:
+        sort_request = {
+            "sortRange": {
+                "range": {
+                    "sheetId": worksheet.id,
+                    "startRowIndex": 1,
+                    "endRowIndex": last_row,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": len(YAHOO_SHEET_HEADERS)
+                },
+                "sortSpecs": [
+                    {
+                        "dimensionIndex": 2,
+                        "sortOrder": "DESCENDING"
+                    }
+                ]
+            }
+        }
+        worksheet.spreadsheet.batch_update({"requests": [sort_request]})
+        print(" ✅ SOURCEシートを投稿日時の**新しい順**にGoogle Sheets APIで並び替えました。")
+    except Exception as e:
+        print(f" ⚠️ スプレッドシート上のソートエラー: {e}")
     # --- 【修正ポイント①】スプレッドシート上でのソート (APIソート) ---
     try:
         last_col_index = len(YAHOO_SHEET_HEADERS) # 9 (I列)
